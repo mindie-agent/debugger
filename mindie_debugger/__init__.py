@@ -51,6 +51,7 @@ from .aclgraph import (
     ACLGraphAddressTracker,
     ACLGraphCaptureGuard,
     ACLGraphDumper,
+    ACLGraphVllmInspector,
 )
 
 __version__ = "0.1.0"
@@ -58,6 +59,7 @@ __all__ = [
     "ACLGraphAddressTracker",
     "ACLGraphCaptureGuard",
     "ACLGraphDumper",
+    "ACLGraphVllmInspector",
     "CallCapsule",
     "FakeQuantContract",
     "LockstepDiffer",

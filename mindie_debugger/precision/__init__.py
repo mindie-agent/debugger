@@ -47,11 +47,13 @@ from ..aclgraph import (
     ACLGraphAddressTracker,
     ACLGraphCaptureGuard,
     ACLGraphDumper,
+    ACLGraphVllmInspector,
 )
 from .stimulus import build_deterministic_stimulus, slim_moe_checkpoint
 
 __all__ = [
     "ACLGraphAddressTracker", "ACLGraphCaptureGuard", "ACLGraphDumper",
+    "ACLGraphVllmInspector",
     "StateSnapshot", "StorageGraph", "StorageNode", "TensorViewSpec", "_require_torch",
     "capture_state_snapshot", "restore_state_snapshot", "reconstruct_from_snapshot",
     "snapshot_tensor_map", "walk_tree", "map_tree", "flatten_tree_with_paths",

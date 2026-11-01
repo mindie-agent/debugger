@@ -23,6 +23,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import re
+import runpy
 import sys
 from pathlib import Path
 
@@ -45,6 +48,12 @@ def _add_precision_subparsers(pactions):
     replay.add_argument("--reference-atol", type=float, default=1e-3)
     replay.add_argument("--reference-rtol", type=float, default=1e-3)
     replay.add_argument("--save-output")
+    check_call = pactions.add_parser(
+        "check-call", aliases=["check_call"],
+        help="capture and run FP32 reference_check + sensitivity probes on a callable")
+    check_call.add_argument("--callable", required=True, help="module:qualname returning (fn, args, kwargs) or zero-arg fn")
+    check_call.add_argument("--reference-atol", type=float, default=1e-3)
+    check_call.add_argument("--reference-rtol", type=float, default=1e-3)
     compare = pactions.add_parser(
         "compare-traces", aliases=["compare_traces", "lockstep-diff"],
         help="compare two lockstep JSON reports")
@@ -69,20 +78,43 @@ def _add_precision_subparsers(pactions):
     watch.add_argument("--latch", action="store_true")
 
 
+def _add_aclgraph_subparsers(aactions):
+    guard = aactions.add_parser(
+        "guard",
+        help="run a script or callable under ACLGraphCaptureGuard to catch host-sync ops (.item/.tolist/.cpu)")
+    guard.add_argument("--script", help="path to Python script to execute")
+    guard.add_argument("--callable", help="module:qualname callable to execute")
+    guard.add_argument("--strict", action="store_true", help="raise immediately on first host-sync op")
+    inspect_cmd = aactions.add_parser(
+        "inspect", aliases=["run"],
+        help="run a vllm-ascend script or callable under ACLGraphVllmInspector (guard + address tracker + layer dumper)")
+    inspect_cmd.add_argument("--script", help="path to Python script to execute")
+    inspect_cmd.add_argument("--callable", help="module:qualname callable to execute")
+    inspect_cmd.add_argument("--include", default="*", help="comma-separated module glob patterns to dump")
+    inspect_cmd.add_argument("--compare-eager", action="store_true", help="compare replayed ACLGraph layers against eager")
+    inspect_cmd.add_argument("--atol", type=float, default=1e-3)
+    inspect_cmd.add_argument("--rtol", type=float, default=1e-3)
+
+
 def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(
         prog="mindie-debugger",
-        description="Ascend NPU CANN fault triage and 3-primitive precision/memory-stomp debugger")
+        description="Ascend NPU CANN fault triage, 3-primitive precision/memory-stomp, and ACLGraph debugger")
     sub = result.add_subparsers(dest="command", required=True)
-    triage = sub.add_parser("triage", help="triage Ascend NPU plog / stderr fault text")
+    triage = sub.add_parser("triage", help="triage Ascend NPU plog / stderr fault text or multi-rank log directory")
     triage.add_argument("--file", "-f", help="path to log file (reads stdin if omitted)")
+    triage.add_argument("--root", "-r", help="path to log directory containing multi-rank *.log / plog* files")
     triage.add_argument("--text", help="inline log text to triage")
     decode = sub.add_parser("decode-code", help="decode a CANN / RTS / HCCL error code")
-    decode.add_argument("code", help="error code (e.g. 507015, EZ9999, EI0006)")
+    decode.add_argument("code", help="error code (e.g. 507015, EZ9999, EI0006, 207008)")
     precision = sub.add_parser(
-        "precision", help="storage-graph precision debugging: inspect capsule, replay, diff, slim MoE")
+        "precision", help="storage-graph precision debugging: inspect capsule, replay, check-call, diff, slim MoE")
     pactions = precision.add_subparsers(dest="precision_action", required=True)
     _add_precision_subparsers(pactions)
+    aclgraph = sub.add_parser(
+        "aclgraph", help="ACLGraph (torch.npu.NPUGraph / vllm-ascend ACLGraphWrapper) capture guard, address tracker & layer dumper")
+    aactions = aclgraph.add_subparsers(dest="aclgraph_action", required=True)
+    _add_aclgraph_subparsers(aactions)
     return result
 
 
@@ -112,6 +144,9 @@ def _import_callable(spec):
     if not spec:
         return None
     import importlib
+    cwd = os.getcwd()
+    if cwd not in sys.path:
+        sys.path.insert(0, cwd)
     module_name, separator, qualname = spec.partition(":")
     if not separator or not module_name:
         raise ValueError("callable must be module:qualname")
@@ -207,6 +242,21 @@ def _run_precision(args):
             import torch
             torch.save(result["outputs"], args.save_output)
         return _jsonable(result), (0 if result.get("status") == "ok" else 1)
+    if action == "check-call":
+        from .precision import capture_call, replay_call
+        target = _import_callable(args.callable)
+        spec = target()
+        if isinstance(spec, tuple) and len(spec) >= 2 and callable(spec[0]):
+            fn = spec[0]
+            call_args = spec[1] if isinstance(spec[1], (list, tuple)) else (spec[1],)
+            call_kwargs = spec[2] if len(spec) >= 3 and isinstance(spec[2], dict) else {}
+        else:
+            fn, call_args, call_kwargs = target, (), {}
+        cap = capture_call(fn, *call_args, **call_kwargs)
+        result = replay_call(
+            cap, fn, mode="reference_check",
+            reference_atol=args.reference_atol, reference_rtol=args.reference_rtol)
+        return _jsonable(result), (0 if result.get("status") == "ok" else 1)
     if action == "compare-traces":
         baseline = getattr(args, "baseline", None) or args.baseline_opt
         target = getattr(args, "target", None) or args.target_opt
@@ -237,6 +287,81 @@ def _run_precision(args):
     return {"status": "error", "reason": "unknown_precision_action"}, 2
 
 
+def _triage_directory(root_dir: Path) -> str:
+    rank_pat = re.compile(r"rank[_-]?(\d+)", re.IGNORECASE)
+    chunks: list[str] = []
+    for path in sorted(root_dir.rglob("*")):
+        if not path.is_file():
+            continue
+        if path.suffix.lower() not in (".log", ".txt", ".out", ".err") and not path.name.startswith("plog"):
+            continue
+        m = rank_pat.search(path.name) or rank_pat.search(str(path.parent))
+        inferred_rank = m.group(1) if m else None
+        for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+            if inferred_rank is not None and "rank_id" not in line and "rank " not in line.lower():
+                chunks.append(f"[rank_id: {inferred_rank}] {line}")
+            else:
+                chunks.append(line)
+    return "\n".join(chunks)
+
+
+def _run_aclgraph(args):
+    from .aclgraph import ACLGraphCaptureGuard, ACLGraphVllmInspector
+    action = args.aclgraph_action.replace("_", "-")
+    if action in ("run",):
+        action = "inspect"
+    cwd = os.getcwd()
+    if cwd not in sys.path:
+        sys.path.insert(0, cwd)
+    if action == "guard":
+        err_info = None
+        with ACLGraphCaptureGuard(strict=bool(args.strict)) as guard:
+            try:
+                if args.script:
+                    runpy.run_path(str(Path(args.script).resolve()), run_name="__main__")
+                elif args.callable:
+                    _import_callable(args.callable)()
+                else:
+                    return {"status": "error", "reason": "script_or_callable_required"}, 1
+            except Exception as exc:
+                err_info = f"{type(exc).__name__}: {exc}"
+        rep = guard.report()
+        if err_info:
+            rep["exception"] = err_info
+        code = 0 if (rep["status"] == "ok" and err_info is None) else 1
+        return rep, code
+    if action == "inspect":
+        include = tuple(p.strip() for p in str(args.include).split(",") if p.strip()) or ("*",)
+        err_info = None
+        with ACLGraphVllmInspector(
+            include=include,
+            compare_eager=bool(args.compare_eager),
+            atol=float(args.atol),
+            rtol=float(args.rtol),
+        ) as inspector:
+            with ACLGraphCaptureGuard(strict=False) as guard:
+                try:
+                    if args.script:
+                        runpy.run_path(str(Path(args.script).resolve()), run_name="__main__")
+                    elif args.callable:
+                        _import_callable(args.callable)()
+                    else:
+                        return {"status": "error", "reason": "script_or_callable_required"}, 1
+                except Exception as exc:
+                    err_info = f"{type(exc).__name__}: {exc}"
+        rep = inspector.report()
+        for v in guard.report().get("violations", []):
+            if v not in rep["capture_guard_violations"]:
+                rep["capture_guard_violations"].append(v)
+        if rep["capture_guard_violations"]:
+            rep["status"] = "violation"
+        if err_info:
+            rep["exception"] = err_info
+        code = 0 if (rep["status"] == "ok" and err_info is None) else 1
+        return rep, code
+    return {"status": "error", "reason": "unknown_aclgraph_action"}, 2
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
     if args.command == "decode-code":
@@ -247,12 +372,23 @@ def main(argv: list[str] | None = None) -> int:
         from .npu_fault_triage import triage_npu_fault
         if args.text is not None:
             text = args.text
+        elif getattr(args, "root", None):
+            text = _triage_directory(Path(args.root))
         elif args.file:
             text = Path(args.file).read_text(encoding="utf-8", errors="replace")
         else:
             text = sys.stdin.read()
         print(json.dumps(triage_npu_fault(text), ensure_ascii=True))
         return 0
+    if args.command == "aclgraph":
+        try:
+            result, code = _run_aclgraph(args)
+        except Exception as exc:
+            result = {"status": "error", "category": "aclgraph_operation_failed",
+                      "error_type": type(exc).__name__, "error": str(exc)[:240]}
+            code = 1
+        print(json.dumps(_jsonable(result), ensure_ascii=True, default=str))
+        return int(code)
     if args.command == "precision":
         try:
             result, code = _run_precision(args)

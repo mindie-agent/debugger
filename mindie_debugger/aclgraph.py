@@ -445,3 +445,169 @@ class ACLGraphDumper:
     def __exit__(self, exc_type, exc, tb) -> bool:
         self.close()
         return False
+
+
+class ACLGraphVllmInspector:
+    """Hooks vllm-ascend's ACLGraphWrapper to audit capture syncs, address stability, and layer dumps."""
+
+    def __init__(
+        self,
+        *,
+        include: tuple[str, ...] | list[str] = ("*",),
+        max_steps: int = 8,
+        strict_guard: bool = False,
+        compare_eager: bool = False,
+        atol: float = 1e-3,
+        rtol: float = 1e-3,
+    ):
+        self.include = tuple(include)
+        self.max_steps = int(max_steps)
+        self.strict_guard = bool(strict_guard)
+        self.compare_eager = bool(compare_eager)
+        self.atol = float(atol)
+        self.rtol = float(rtol)
+        self.guard_violations: list[dict[str, Any]] = []
+        self.address_reports: list[dict[str, Any]] = []
+        self.layer_diffs: list[dict[str, Any]] = []
+        self.dumpers: dict[int, ACLGraphDumper] = {}
+        self.trackers: dict[Any, ACLGraphAddressTracker] = {}
+        self._orig_call: Callable | None = None
+        self._wrapper_cls: Any = None
+
+    def attach(self) -> ACLGraphVllmInspector:
+        try:
+            from vllm_ascend.compilation.acl_graph import ACLGraphWrapper
+        except ImportError:
+            return self
+        if self._orig_call is not None:
+            return self
+        self._wrapper_cls = ACLGraphWrapper
+        self._orig_call = ACLGraphWrapper.__call__
+        inspector = self
+        orig_call = self._orig_call
+
+        def _wrapped_call(wrapper_self, *args, **kwargs):
+            torch = _require_torch()
+            try:
+                from vllm.forward_context import get_forward_context
+                fwd_ctx = get_forward_context()
+                batch_desc = getattr(fwd_ctx, "batch_descriptor", None)
+                attn_meta = getattr(fwd_ctx, "attn_metadata", None)
+            except Exception:
+                fwd_ctx = None
+                batch_desc = None
+                attn_meta = None
+
+            entries = getattr(wrapper_self, "concrete_aclgraph_entries", {})
+            entry = entries.get(batch_desc) if batch_desc is not None else None
+            is_capturing = entry is None or getattr(entry, "aclgraph", None) is None
+
+            runnable = getattr(wrapper_self, "runnable", None)
+            dumper = inspector.dumpers.get(id(wrapper_self))
+            if dumper is None and isinstance(runnable, torch.nn.Module):
+                dev = next((p.device for p in runnable.parameters()), torch.device("cpu"))
+                dumper = ACLGraphDumper(
+                    runnable,
+                    include=inspector.include,
+                    max_steps=inspector.max_steps,
+                    device=dev,
+                )
+                inspector.dumpers[id(wrapper_self)] = dumper
+
+            meta_dict: dict[str, Any] = {}
+            for idx, arg in enumerate(args):
+                if isinstance(arg, torch.Tensor):
+                    meta_dict[f"arg_{idx}"] = arg
+            for k, v in kwargs.items():
+                if isinstance(v, torch.Tensor):
+                    meta_dict[f"kw_{k}"] = v
+            if isinstance(attn_meta, dict):
+                for sub_meta in attn_meta.values():
+                    for attr in ("slot_mapping", "seq_lens", "query_start_loc"):
+                        val = getattr(sub_meta, attr, None)
+                        if isinstance(val, torch.Tensor):
+                            meta_dict.setdefault(attr, val)
+            elif attn_meta is not None:
+                for attr in ("slot_mapping", "seq_lens", "query_start_loc"):
+                    val = getattr(attn_meta, attr, None)
+                    if isinstance(val, torch.Tensor):
+                        meta_dict[attr] = val
+
+            tracker = inspector.trackers.setdefault(batch_desc, ACLGraphAddressTracker())
+            if is_capturing:
+                tracker.record_capture(meta=meta_dict)
+                if dumper is not None:
+                    dumper.reset_step(0)
+                with ACLGraphCaptureGuard(strict=inspector.strict_guard) as guard:
+                    out = orig_call(wrapper_self, *args, **kwargs)
+                rep = guard.report()
+                if rep["violations"]:
+                    inspector.guard_violations.extend(rep["violations"])
+                return out
+
+            actual_tokens = getattr(attn_meta, "num_actual_tokens", None)
+            padded_tokens = getattr(batch_desc, "num_tokens", None) if batch_desc is not None else None
+            addr_rep = tracker.verify_replay(
+                meta=meta_dict,
+                actual_tokens=actual_tokens,
+                padded_tokens=padded_tokens,
+            )
+            inspector.address_reports.append(addr_rep)
+            step_idx = 0
+            if dumper is not None:
+                dumper.advance_step()
+                step_idx = int(dumper.step_counter.detach().cpu().item()) % dumper.max_steps
+            out = orig_call(wrapper_self, *args, **kwargs)
+            if dumper is not None and inspector.compare_eager and callable(runnable):
+                diff = dumper.compare_with_eager(
+                    runnable,
+                    *args,
+                    step_index=step_idx,
+                    atol=inspector.atol,
+                    rtol=inspector.rtol,
+                    **kwargs,
+                )
+                inspector.layer_diffs.append(diff)
+            return out
+
+        ACLGraphWrapper.__call__ = _wrapped_call
+        return self
+
+    def close(self) -> None:
+        if self._wrapper_cls is not None and self._orig_call is not None:
+            self._wrapper_cls.__call__ = self._orig_call
+            self._orig_call = None
+        for dumper in self.dumpers.values():
+            dumper.close()
+        self.dumpers.clear()
+
+    def report(self) -> dict[str, Any]:
+        addr_violations = [
+            v for rep in self.address_reports for v in rep.get("violations", [])
+        ]
+        diverged_diffs = [d for d in self.layer_diffs if d.get("status") == "diverged"]
+        has_issue = bool(self.guard_violations or addr_violations or diverged_diffs)
+        return {
+            "status": "violation" if has_issue else "ok",
+            "capture_guard_violations": list(self.guard_violations),
+            "address_violations": addr_violations,
+            "layer_diffs": list(self.layer_diffs),
+            "first_divergent_layer": (
+                diverged_diffs[0].get("first_divergent_layer") if diverged_diffs else None
+            ),
+        }
+
+    def __enter__(self) -> ACLGraphVllmInspector:
+        return self.attach()
+
+    def __exit__(self, exc_type, exc, tb) -> bool:
+        self.close()
+        return False
+
+
+__all__ = [
+    "ACLGraphAddressTracker",
+    "ACLGraphCaptureGuard",
+    "ACLGraphDumper",
+    "ACLGraphVllmInspector",
+]
