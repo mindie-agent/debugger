@@ -81,15 +81,18 @@ def _add_precision_subparsers(pactions):
 def _add_aclgraph_subparsers(aactions):
     guard = aactions.add_parser(
         "guard",
-        help="run a script or callable under ACLGraphCaptureGuard to catch host-sync ops (.item/.tolist/.cpu)")
-    guard.add_argument("--script", help="path to Python script to execute")
+        help="run a script/callable under ACLGraphCaptureGuard or audit source files for graph-capture contract bugs")
+    guard.add_argument("target", nargs="?", help="optional path to Python script, source file, or directory")
+    guard.add_argument("--script", "--path", "-p", dest="script", help="path to Python script, source file, or directory")
     guard.add_argument("--callable", help="module:qualname callable to execute")
     guard.add_argument("--strict", action="store_true", help="raise immediately on first host-sync op")
     inspect_cmd = aactions.add_parser(
-        "inspect", aliases=["run"],
-        help="run a vllm-ascend script or callable under ACLGraphVllmInspector (guard + address tracker + layer dumper)")
-    inspect_cmd.add_argument("--script", help="path to Python script to execute")
+        "inspect", aliases=["run", "audit"],
+        help="inspect vllm-ascend / MindIE-SD source files or run a script under ACLGraphVllmInspector")
+    inspect_cmd.add_argument("target", nargs="?", help="optional path to Python script, source file, or directory")
+    inspect_cmd.add_argument("--script", "--path", "-p", dest="script", help="path to Python script, source file, or directory")
     inspect_cmd.add_argument("--callable", help="module:qualname callable to execute")
+    inspect_cmd.add_argument("--dump-dir", help="optional directory to save per-layer ACLGraph dumps")
     inspect_cmd.add_argument("--include", default="*", help="comma-separated module glob patterns to dump")
     inspect_cmd.add_argument("--compare-eager", action="store_true", help="compare replayed ACLGraph layers against eager")
     inspect_cmd.add_argument("--atol", type=float, default=1e-3)
@@ -307,56 +310,79 @@ def _triage_directory(root_dir: Path) -> str:
 
 def _run_aclgraph(args):
     from .aclgraph import ACLGraphCaptureGuard, ACLGraphVllmInspector
+    from .aclgraph_audit import audit_aclgraph_contracts
     action = args.aclgraph_action.replace("_", "-")
-    if action in ("run",):
+    if action in ("run", "audit"):
         action = "inspect"
     cwd = os.getcwd()
     if cwd not in sys.path:
         sys.path.insert(0, cwd)
+    target_arg = getattr(args, "script", None) or getattr(args, "target", None)
+    audit_rep = audit_aclgraph_contracts(target_arg) if target_arg and Path(target_arg).exists() else None
+    is_dir = bool(target_arg and Path(target_arg).is_dir())
     if action == "guard":
         err_info = None
         with ACLGraphCaptureGuard(strict=bool(args.strict)) as guard:
-            try:
-                if args.script:
-                    runpy.run_path(str(Path(args.script).resolve()), run_name="__main__")
-                elif args.callable:
-                    _import_callable(args.callable)()
-                else:
-                    return {"status": "error", "reason": "script_or_callable_required"}, 1
-            except Exception as exc:
-                err_info = f"{type(exc).__name__}: {exc}"
-        rep = guard.report()
-        if err_info:
-            rep["exception"] = err_info
-        code = 0 if (rep["status"] == "ok" and err_info is None) else 1
-        return rep, code
-    if action == "inspect":
-        include = tuple(p.strip() for p in str(args.include).split(",") if p.strip()) or ("*",)
-        err_info = None
-        with ACLGraphVllmInspector(
-            include=include,
-            compare_eager=bool(args.compare_eager),
-            atol=float(args.atol),
-            rtol=float(args.rtol),
-        ) as inspector:
-            with ACLGraphCaptureGuard(strict=False) as guard:
+            if not is_dir:
                 try:
-                    if args.script:
-                        runpy.run_path(str(Path(args.script).resolve()), run_name="__main__")
+                    if target_arg:
+                        runpy.run_path(str(Path(target_arg).resolve()), run_name="__main__")
                     elif args.callable:
                         _import_callable(args.callable)()
                     else:
                         return {"status": "error", "reason": "script_or_callable_required"}, 1
                 except Exception as exc:
                     err_info = f"{type(exc).__name__}: {exc}"
+        rep = guard.report()
+        if audit_rep is not None:
+            rep["contract_violations"] = audit_rep["contract_violations"]
+            if audit_rep["contract_violations"]:
+                rep["status"] = "violation"
+        if err_info:
+            if audit_rep is not None and err_info.startswith("ModuleNotFoundError:"):
+                rep["runtime_skipped_reason"] = err_info
+                err_info = None
+            else:
+                rep["exception"] = err_info
+        code = 0 if (rep["status"] == "ok" and err_info is None) else 1
+        return rep, code
+    if action == "inspect":
+        include = tuple(p.strip() for p in str(args.include).split(",") if p.strip()) or ("*",)
+        err_info = None
+        with ACLGraphVllmInspector(
+            dump_dir=getattr(args, "dump_dir", None),
+            include=include,
+            compare_eager=bool(args.compare_eager),
+            atol=float(args.atol),
+            rtol=float(args.rtol),
+        ) as inspector:
+            with ACLGraphCaptureGuard(strict=False) as guard:
+                if not is_dir:
+                    try:
+                        if target_arg:
+                            runpy.run_path(str(Path(target_arg).resolve()), run_name="__main__")
+                        elif args.callable:
+                            _import_callable(args.callable)()
+                        else:
+                            return {"status": "error", "reason": "script_or_callable_required"}, 1
+                    except Exception as exc:
+                        err_info = f"{type(exc).__name__}: {exc}"
         rep = inspector.report()
         for v in guard.report().get("violations", []):
             if v not in rep["capture_guard_violations"]:
                 rep["capture_guard_violations"].append(v)
+        if audit_rep is not None:
+            rep["contract_violations"] = audit_rep["contract_violations"]
+            if audit_rep["contract_violations"]:
+                rep["status"] = "violation"
         if rep["capture_guard_violations"]:
             rep["status"] = "violation"
         if err_info:
-            rep["exception"] = err_info
+            if audit_rep is not None and err_info.startswith("ModuleNotFoundError:"):
+                rep["runtime_skipped_reason"] = err_info
+                err_info = None
+            else:
+                rep["exception"] = err_info
         code = 0 if (rep["status"] == "ok" and err_info is None) else 1
         return rep, code
     return {"status": "error", "reason": "unknown_aclgraph_action"}, 2
@@ -369,6 +395,7 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(decode_cann_error_code(args.code), ensure_ascii=True))
         return 0
     if args.command == "triage":
+        from .aclgraph_audit import augment_triage_with_runtime_clues
         from .npu_fault_triage import triage_npu_fault
         if args.text is not None:
             text = args.text
@@ -378,7 +405,7 @@ def main(argv: list[str] | None = None) -> int:
             text = Path(args.file).read_text(encoding="utf-8", errors="replace")
         else:
             text = sys.stdin.read()
-        print(json.dumps(triage_npu_fault(text), ensure_ascii=True))
+        print(json.dumps(augment_triage_with_runtime_clues(text, triage_npu_fault(text)), ensure_ascii=True))
         return 0
     if args.command == "aclgraph":
         try:
