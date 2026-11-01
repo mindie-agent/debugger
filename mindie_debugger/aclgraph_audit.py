@@ -198,8 +198,6 @@ def audit_aclgraph_contracts(target: str | Path) -> dict[str, Any]:
 
 def augment_triage_with_runtime_clues(text: str, base_result: dict[str, Any]) -> dict[str, Any]:
     """Enrich CANN triage output when the log contains Python/vllm-ascend failure signatures."""
-    if base_result.get("fault_count", 0) > 0:
-        return base_result
     clues: list[dict[str, Any]] = []
     actions: list[str] = []
     lower = text.lower()
@@ -250,6 +248,7 @@ def augment_triage_with_runtime_clues(text: str, base_result: dict[str, Any]) ->
         enriched = dict(base_result)
         enriched["runtime_fault_clues"] = clues
         enriched["recommended_next_steps"] = actions + list(base_result.get("recommended_next_steps", []))
-        enriched["summary"] = clues[0]["diagnosis"]
+        if base_result.get("fault_count", 0) == 0:
+            enriched["summary"] = clues[0]["diagnosis"]
         return enriched
     return base_result
