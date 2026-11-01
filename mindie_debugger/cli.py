@@ -1,23 +1,25 @@
-"""CLI entry point (`mindie-debugger`) for CANN fault triage and NPU precision debugging.
+"""CLI entry point (`mindie-debugger`) for CANN fault triage, ACLGraph, and NPU precision debugging.
 
 [Role]
   Provides the `mindie-debugger` command-line interface for deterministic CANN
-  `plog` / error-code triage (`triage`, `decode-code`) and the 3-primitive
-  precision/memory-stomp toolkit (`precision`: `inspect-capsule`, `replay-call`
-  / `call-repro`, `compare-traces` / `lockstep-diff`, `slim-moe`, `watch`).
+  `plog` / error-code triage (`triage`, `decode-code`), the 3-primitive
+  precision/memory-stomp toolkit (`precision`), ACLGraph capture/replay
+  debugging (`aclgraph`), and remote NPU container staging (`remote-guide`).
 
 [Invariants]
-  * All subcommands emit single-line ASCII JSON to stdout and return 0 on
-    success or non-zero on error/divergence.
-  * Triage subcommands are zero-dependency (`torch` is imported lazily only by
-    precision subcommands that load capsules or replay calls).
+  * All subcommands emit single-line ASCII JSON to stdout.
+  * Triage and `remote-guide` subcommands are zero-NPU-dependency (`torch` is
+    imported lazily only by precision/aclgraph runtime hooks).
+  * When an NPU-dependent command is invoked on a host without `torch_npu` /
+    `vllm` / NPU runtime, `mindie-debugger` stages a clean pure-Python bundle
+    locally and emits a `remote_npu_execution_guide` for `remote-dev`.
 
 [Timeouts & Locks]
   Single-invocation CLI; acquires no locks and spawns no background threads.
 
 [Side-Effect Policy]
   Reads user-specified log/capsule/trace files and writes only to explicitly
-  requested `--output` / `--save-output` / `output_dir` paths.
+  requested `--output` / `--save-output` / `--stage-dir` or bundle cache paths.
 """
 from __future__ import annotations
 
@@ -26,8 +28,116 @@ import json
 import os
 import re
 import runpy
+import shlex
+import shutil
 import sys
 from pathlib import Path
+from typing import Any
+
+
+def _stage_remote_bundle(stage_dir: str | Path | None = None) -> Path:
+    """Copy clean `.py` sources of `mindie_debugger` (no `__pycache__`) to a local staging directory."""
+    pkg_src = Path(__file__).resolve().parent
+    if stage_dir is not None:
+        bundle_root = Path(stage_dir).expanduser().resolve()
+    else:
+        data_home = Path(
+            os.environ.get("MINDIE_DATA_HOME")
+            or (Path.home() / ".local" / "share" / "mindie-agent")
+        ).expanduser().resolve()
+        bundle_root = data_home / "debugger-bundle" / "mindie_debugger"
+    if bundle_root.exists():
+        shutil.rmtree(bundle_root)
+    bundle_root.mkdir(parents=True, exist_ok=True)
+    for py_file in sorted(pkg_src.rglob("*.py")):
+        if "__pycache__" in py_file.parts:
+            continue
+        rel = py_file.relative_to(pkg_src)
+        dest = bundle_root / rel
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(py_file, dest)
+    return bundle_root
+
+
+def _build_remote_execution_guide(
+    argv: list[str] | None = None,
+    stage_dir: str | Path | None = None,
+) -> dict[str, Any]:
+    bundle_path = _stage_remote_bundle(stage_dir)
+    quoted_args = " ".join(shlex.quote(a) for a in (argv or ["aclgraph", "inspect", "--script", "<repro.py>"]))
+    return {
+        "summary": (
+            "Dynamic ACLGraph and NPU precision tools require the target Ascend NPU container runtime "
+            "(torch_npu / CANN / vllm-ascend). Push the staged pure-Python `mindie_debugger` bundle to the "
+            "remote NPU container with `mcp__remote-dev__remote_artifact_push` and execute it with "
+            "`mcp__remote-dev__remote_bash`."
+        ),
+        "local_bundle_path": str(bundle_path),
+        "remote_stage_path": ".mindie_debugger/mindie_debugger",
+        "step_1_push_bundle_to_npu_container": {
+            "mcp_tool": "mcp__remote-dev__remote_artifact_push",
+            "arguments": {
+                "local_path": str(bundle_path),
+                "remote_path": ".mindie_debugger/mindie_debugger",
+            },
+        },
+        "step_2_execute_cli_in_npu_container": {
+            "mcp_tool": "mcp__remote-dev__remote_bash",
+            "command": f"PYTHONPATH=.mindie_debugger:$PYTHONPATH python3 -m mindie_debugger.cli {quoted_args}",
+            "cli_examples": {
+                "triage_logs": "PYTHONPATH=.mindie_debugger:$PYTHONPATH python3 -m mindie_debugger.cli triage --root <log_dir>",
+                "aclgraph_guard": "PYTHONPATH=.mindie_debugger:$PYTHONPATH python3 -m mindie_debugger.cli aclgraph guard --script <repro_or_test.py>",
+                "aclgraph_inspect": (
+                    "PYTHONPATH=.mindie_debugger:$PYTHONPATH python3 -m mindie_debugger.cli aclgraph inspect "
+                    "--script <repro_or_test.py> --compare-eager --dump-dir /tmp/aclgraph_dump"
+                ),
+                "precision_check_call": (
+                    "PYTHONPATH=.mindie_debugger:$PYTHONPATH python3 -m mindie_debugger.cli precision check-call "
+                    "--callable <module:qualname>"
+                ),
+                "precision_replay_call": (
+                    "PYTHONPATH=.mindie_debugger:$PYTHONPATH python3 -m mindie_debugger.cli precision replay-call "
+                    "--capsule <capsule.pt> --det-lock"
+                ),
+            },
+        },
+        "step_3_python_api_in_npu_container": {
+            "ACLGraphCaptureGuard": (
+                "from mindie_debugger.aclgraph import ACLGraphCaptureGuard\n"
+                "with ACLGraphCaptureGuard(strict=False) as guard:\n"
+                "    # run model warmup + graph capture\n"
+                "print(guard.report())  # catches .item(), .cpu(), bool(tensor), .tolist() during capture"
+            ),
+            "ACLGraphAddressTracker": (
+                "from mindie_debugger.aclgraph import ACLGraphAddressTracker\n"
+                "tracker = ACLGraphAddressTracker()\n"
+                "tracker.bind_capture_inputs(meta={'slot_mapping': slot_mapping, 'seq_lens': seq_lens})\n"
+                "# during graph replay:\n"
+                "rep = tracker.verify_replay_inputs(actual_tokens=actual, padded_tokens=padded, "
+                "slot_mapping_tensor=slot_mapping, meta={'slot_mapping': slot_mapping, 'seq_lens': seq_lens})\n"
+                "print(rep)  # detects rebound_pointer and unmasked_padded_slot_mapping"
+            ),
+            "ACLGraphDumper": (
+                "from mindie_debugger.aclgraph import ACLGraphDumper\n"
+                "with ACLGraphDumper(model, include=('*attn*', '*mlp*', '*conv*'), max_steps=4, device=device) as dumper:\n"
+                "    dumper.reset_step(0)  # before capture / step 0\n"
+                "    dumper.advance_step()  # before subsequent g.replay() steps\n"
+                "    diff = dumper.compare_with_eager(eager_fn, static_input, step_index=1, atol=1e-3)\n"
+                "    print(diff['first_divergent_layer'], diff['per_layer'])"
+            ),
+            "ACLGraphVllmInspector": (
+                "from mindie_debugger.aclgraph import ACLGraphVllmInspector\n"
+                "with ACLGraphVllmInspector(dump_dir='/tmp/acl_dump', compare_eager=True) as inspector:\n"
+                "    # run vllm-ascend ACLGraphWrapper capture and replay\n"
+                "print(inspector.report())"
+            ),
+            "precision_primitives": (
+                "from mindie_debugger.precision import capture_call, replay_call\n"
+                "cap = capture_call(fn, *args, **kwargs)\n"
+                "print(replay_call(cap, fn, mode='reference_check', reference_atol=1e-3))"
+            ),
+        },
+    }
 
 
 def _add_precision_subparsers(pactions):
@@ -81,16 +191,16 @@ def _add_precision_subparsers(pactions):
 def _add_aclgraph_subparsers(aactions):
     guard = aactions.add_parser(
         "guard",
-        help="run a script/callable under ACLGraphCaptureGuard or audit source files for graph-capture contract bugs")
-    guard.add_argument("target", nargs="?", help="optional path to Python script, source file, or directory")
-    guard.add_argument("--script", "--path", "-p", dest="script", help="path to Python script, source file, or directory")
+        help="run a script/callable under ACLGraphCaptureGuard to catch host-device syncs during graph capture")
+    guard.add_argument("target", nargs="?", help="optional path to Python script")
+    guard.add_argument("--script", "--path", "-p", dest="script", help="path to Python script")
     guard.add_argument("--callable", help="module:qualname callable to execute")
     guard.add_argument("--strict", action="store_true", help="raise immediately on first host-sync op")
     inspect_cmd = aactions.add_parser(
-        "inspect", aliases=["run", "audit"],
-        help="inspect vllm-ascend / MindIE-SD source files or run a script under ACLGraphVllmInspector")
-    inspect_cmd.add_argument("target", nargs="?", help="optional path to Python script, source file, or directory")
-    inspect_cmd.add_argument("--script", "--path", "-p", dest="script", help="path to Python script, source file, or directory")
+        "inspect", aliases=["run", "audit", "dump"],
+        help="run a script/callable under ACLGraphVllmInspector (capture guard + address tracker + layer dumper)")
+    inspect_cmd.add_argument("target", nargs="?", help="optional path to Python script")
+    inspect_cmd.add_argument("--script", "--path", "-p", dest="script", help="path to Python script")
     inspect_cmd.add_argument("--callable", help="module:qualname callable to execute")
     inspect_cmd.add_argument("--dump-dir", help="optional directory to save per-layer ACLGraph dumps")
     inspect_cmd.add_argument("--include", default="*", help="comma-separated module glob patterns to dump")
@@ -110,6 +220,10 @@ def parser() -> argparse.ArgumentParser:
     triage.add_argument("--text", help="inline log text to triage")
     decode = sub.add_parser("decode-code", help="decode a CANN / RTS / HCCL error code")
     decode.add_argument("code", help="error code (e.g. 507015, EZ9999, EI0006, 207008)")
+    guide = sub.add_parser(
+        "remote-guide", aliases=["guide", "stage-remote", "how-to-run"],
+        help="stage the pure-Python mindie_debugger bundle and print remote-dev NPU container execution instructions")
+    guide.add_argument("--stage-dir", help="optional local directory to write the clean mindie_debugger bundle")
     precision = sub.add_parser(
         "precision", help="storage-graph precision debugging: inspect capsule, replay, check-call, diff, slim MoE")
     pactions = precision.add_subparsers(dest="precision_action", required=True)
@@ -215,51 +329,67 @@ def _precision_compare(baseline_path, target_path):
     }
 
 
-def _run_precision(args):
+def _is_npu_env_missing_error(exc: BaseException) -> bool:
+    if isinstance(exc, ModuleNotFoundError):
+        return True
+    msg = f"{type(exc).__name__}: {exc}".lower()
+    return any(tok in msg for tok in ("torch_npu", "vllm", "npu", "ascend", "cann", "triton", "mindie"))
+
+
+def _run_precision(args, raw_argv: list[str] | None = None):
     action = args.precision_action.replace("_", "-")
     if action == "call-repro":
         action = "replay-call"
     if action == "lockstep-diff":
         action = "compare-traces"
-    if action == "inspect-capsule":
-        from .precision import capsule_summary
-        capsule = getattr(args, "capsule", None) or args.capsule_opt
-        if not capsule:
-            return {"status": "error", "reason": "capsule_required"}, 1
-        return capsule_summary(capsule), 0
-    if action == "replay-call":
-        from .precision import replay_call
-        capsule = getattr(args, "capsule", None) or args.capsule_opt
-        if not capsule:
-            return {"status": "error", "reason": "capsule_required"}, 1
-        import torch
-        from .precision.call_repro import _apply_det_lock
-        _apply_det_lock(torch, args.det_lock)
-        fn = _import_callable(args.callable)
-        reference = _import_callable(args.reference)
-        result = replay_call(
-            capsule, fn, repeat=args.repeat, det_lock=args.det_lock,
-            reference_fn=reference, reference_atol=args.reference_atol,
-            reference_rtol=args.reference_rtol)
-        if args.save_output and result.get("outputs") is not None:
+    try:
+        if action == "inspect-capsule":
+            from .precision import capsule_summary
+            capsule = getattr(args, "capsule", None) or args.capsule_opt
+            if not capsule:
+                return {"status": "error", "reason": "capsule_required"}, 1
+            return capsule_summary(capsule), 0
+        if action == "replay-call":
+            from .precision import replay_call
+            capsule = getattr(args, "capsule", None) or args.capsule_opt
+            if not capsule:
+                return {"status": "error", "reason": "capsule_required"}, 1
             import torch
-            torch.save(result["outputs"], args.save_output)
-        return _jsonable(result), (0 if result.get("status") == "ok" else 1)
-    if action == "check-call":
-        from .precision import capture_call, replay_call
-        target = _import_callable(args.callable)
-        spec = target()
-        if isinstance(spec, tuple) and len(spec) >= 2 and callable(spec[0]):
-            fn = spec[0]
-            call_args = spec[1] if isinstance(spec[1], (list, tuple)) else (spec[1],)
-            call_kwargs = spec[2] if len(spec) >= 3 and isinstance(spec[2], dict) else {}
-        else:
-            fn, call_args, call_kwargs = target, (), {}
-        cap = capture_call(fn, *call_args, **call_kwargs)
-        result = replay_call(
-            cap, fn, mode="reference_check",
-            reference_atol=args.reference_atol, reference_rtol=args.reference_rtol)
-        return _jsonable(result), (0 if result.get("status") == "ok" else 1)
+            from .precision.call_repro import _apply_det_lock
+            _apply_det_lock(torch, args.det_lock)
+            fn = _import_callable(args.callable)
+            reference = _import_callable(args.reference)
+            result = replay_call(
+                capsule, fn, repeat=args.repeat, det_lock=args.det_lock,
+                reference_fn=reference, reference_atol=args.reference_atol,
+                reference_rtol=args.reference_rtol)
+            if args.save_output and result.get("outputs") is not None:
+                import torch
+                torch.save(result["outputs"], args.save_output)
+            return _jsonable(result), (0 if result.get("status") == "ok" else 1)
+        if action == "check-call":
+            from .precision import capture_call, replay_call
+            target = _import_callable(args.callable)
+            spec = target()
+            if isinstance(spec, tuple) and len(spec) >= 2 and callable(spec[0]):
+                fn = spec[0]
+                call_args = spec[1] if isinstance(spec[1], (list, tuple)) else (spec[1],)
+                call_kwargs = spec[2] if len(spec) >= 3 and isinstance(spec[2], dict) else {}
+            else:
+                fn, call_args, call_kwargs = target, (), {}
+            cap = capture_call(fn, *call_args, **call_kwargs)
+            result = replay_call(
+                cap, fn, mode="reference_check",
+                reference_atol=args.reference_atol, reference_rtol=args.reference_rtol)
+            return _jsonable(result), (0 if result.get("status") == "ok" else 1)
+    except Exception as exc:
+        if _is_npu_env_missing_error(exc):
+            return {
+                "status": "remote_npu_execution_required",
+                "local_missing_environment": f"{type(exc).__name__}: {exc}",
+                "remote_npu_execution_guide": _build_remote_execution_guide(raw_argv),
+            }, 0
+        raise
     if action == "compare-traces":
         baseline = getattr(args, "baseline", None) or args.baseline_opt
         target = getattr(args, "target", None) or args.target_opt
@@ -308,47 +438,54 @@ def _triage_directory(root_dir: Path) -> str:
     return "\n".join(chunks)
 
 
-def _run_aclgraph(args):
+def _run_aclgraph(args, raw_argv: list[str] | None = None):
     from .aclgraph import ACLGraphCaptureGuard, ACLGraphVllmInspector
-    from .aclgraph_audit import audit_aclgraph_contracts
     action = args.aclgraph_action.replace("_", "-")
-    if action in ("run", "audit"):
+    if action in ("run", "audit", "dump"):
         action = "inspect"
     cwd = os.getcwd()
     if cwd not in sys.path:
         sys.path.insert(0, cwd)
     target_arg = getattr(args, "script", None) or getattr(args, "target", None)
-    audit_rep = audit_aclgraph_contracts(target_arg) if target_arg and Path(target_arg).exists() else None
-    is_dir = bool(target_arg and Path(target_arg).is_dir())
+    if not target_arg and not getattr(args, "callable", None):
+        return {
+            "status": "remote_npu_execution_required",
+            "reason": "Provide --script <repro.py> or --callable <mod:fn> inside the NPU container",
+            "remote_npu_execution_guide": _build_remote_execution_guide(raw_argv),
+        }, 0
+    if target_arg and Path(target_arg).exists() and Path(target_arg).is_dir():
+        return {
+            "status": "remote_npu_execution_required",
+            "reason": f"'{target_arg}' is a source directory; dynamic ACLGraph inspection requires running a script or pytest inside the NPU container.",
+            "remote_npu_execution_guide": _build_remote_execution_guide(raw_argv),
+        }, 0
     if action == "guard":
         err_info = None
+        exc_obj = None
         with ACLGraphCaptureGuard(strict=bool(args.strict)) as guard:
-            if not is_dir:
-                try:
-                    if target_arg:
-                        runpy.run_path(str(Path(target_arg).resolve()), run_name="__main__")
-                    elif args.callable:
-                        _import_callable(args.callable)()
-                    else:
-                        return {"status": "error", "reason": "script_or_callable_required"}, 1
-                except Exception as exc:
-                    err_info = f"{type(exc).__name__}: {exc}"
+            try:
+                if target_arg:
+                    runpy.run_path(str(Path(target_arg).resolve()), run_name="__main__")
+                elif args.callable:
+                    _import_callable(args.callable)()
+            except Exception as exc:
+                exc_obj = exc
+                err_info = f"{type(exc).__name__}: {exc}"
         rep = guard.report()
-        if audit_rep is not None:
-            rep["contract_violations"] = audit_rep["contract_violations"]
-            if audit_rep["contract_violations"]:
-                rep["status"] = "violation"
+        if exc_obj is not None and _is_npu_env_missing_error(exc_obj) and not rep.get("violations"):
+            return {
+                "status": "remote_npu_execution_required",
+                "local_missing_environment": err_info,
+                "remote_npu_execution_guide": _build_remote_execution_guide(raw_argv),
+            }, 0
         if err_info:
-            if audit_rep is not None and err_info.startswith("ModuleNotFoundError:"):
-                rep["runtime_skipped_reason"] = err_info
-                err_info = None
-            else:
-                rep["exception"] = err_info
+            rep["exception"] = err_info
         code = 0 if (rep["status"] == "ok" and err_info is None) else 1
         return rep, code
     if action == "inspect":
         include = tuple(p.strip() for p in str(args.include).split(",") if p.strip()) or ("*",)
         err_info = None
+        exc_obj = None
         with ACLGraphVllmInspector(
             dump_dir=getattr(args, "dump_dir", None),
             include=include,
@@ -357,45 +494,45 @@ def _run_aclgraph(args):
             rtol=float(args.rtol),
         ) as inspector:
             with ACLGraphCaptureGuard(strict=False) as guard:
-                if not is_dir:
-                    try:
-                        if target_arg:
-                            runpy.run_path(str(Path(target_arg).resolve()), run_name="__main__")
-                        elif args.callable:
-                            _import_callable(args.callable)()
-                        else:
-                            return {"status": "error", "reason": "script_or_callable_required"}, 1
-                    except Exception as exc:
-                        err_info = f"{type(exc).__name__}: {exc}"
+                try:
+                    if target_arg:
+                        runpy.run_path(str(Path(target_arg).resolve()), run_name="__main__")
+                    elif args.callable:
+                        _import_callable(args.callable)()
+                except Exception as exc:
+                    exc_obj = exc
+                    err_info = f"{type(exc).__name__}: {exc}"
         rep = inspector.report()
         for v in guard.report().get("violations", []):
             if v not in rep["capture_guard_violations"]:
                 rep["capture_guard_violations"].append(v)
-        if audit_rep is not None:
-            rep["contract_violations"] = audit_rep["contract_violations"]
-            if audit_rep["contract_violations"]:
-                rep["status"] = "violation"
         if rep["capture_guard_violations"]:
             rep["status"] = "violation"
+        if exc_obj is not None and _is_npu_env_missing_error(exc_obj) and rep["status"] == "ok":
+            return {
+                "status": "remote_npu_execution_required",
+                "local_missing_environment": err_info,
+                "remote_npu_execution_guide": _build_remote_execution_guide(raw_argv),
+            }, 0
         if err_info:
-            if audit_rep is not None and err_info.startswith("ModuleNotFoundError:"):
-                rep["runtime_skipped_reason"] = err_info
-                err_info = None
-            else:
-                rep["exception"] = err_info
+            rep["exception"] = err_info
         code = 0 if (rep["status"] == "ok" and err_info is None) else 1
         return rep, code
     return {"status": "error", "reason": "unknown_aclgraph_action"}, 2
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = parser().parse_args(argv)
+    raw_argv = list(argv) if argv is not None else sys.argv[1:]
+    args = parser().parse_args(raw_argv)
+    if args.command in ("remote-guide", "guide", "stage-remote", "how-to-run"):
+        guide = _build_remote_execution_guide( stage_dir=getattr(args, "stage_dir", None))
+        print(json.dumps({"status": "ok", "remote_npu_execution_guide": guide}, ensure_ascii=True))
+        return 0
     if args.command == "decode-code":
         from .npu_fault_triage import decode_cann_error_code
         print(json.dumps(decode_cann_error_code(args.code), ensure_ascii=True))
         return 0
     if args.command == "triage":
-        from .aclgraph_audit import augment_triage_with_runtime_clues
         from .npu_fault_triage import triage_npu_fault
         if args.text is not None:
             text = args.text
@@ -405,11 +542,13 @@ def main(argv: list[str] | None = None) -> int:
             text = Path(args.file).read_text(encoding="utf-8", errors="replace")
         else:
             text = sys.stdin.read()
-        print(json.dumps(augment_triage_with_runtime_clues(text, triage_npu_fault(text)), ensure_ascii=True))
+        payload = triage_npu_fault(text)
+        payload["remote_npu_execution_guide"] = _build_remote_execution_guide()
+        print(json.dumps(payload, ensure_ascii=True))
         return 0
     if args.command == "aclgraph":
         try:
-            result, code = _run_aclgraph(args)
+            result, code = _run_aclgraph(args, raw_argv)
         except Exception as exc:
             result = {"status": "error", "category": "aclgraph_operation_failed",
                       "error_type": type(exc).__name__, "error": str(exc)[:240]}
@@ -418,7 +557,7 @@ def main(argv: list[str] | None = None) -> int:
         return int(code)
     if args.command == "precision":
         try:
-            result, code = _run_precision(args)
+            result, code = _run_precision(args, raw_argv)
         except Exception as exc:
             result = {"status": "error", "category": "precision_operation_failed",
                       "error_type": type(exc).__name__, "error": str(exc)[:240]}
