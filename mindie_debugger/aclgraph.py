@@ -471,20 +471,100 @@ class ACLGraphVllmInspector:
         self.layer_diffs: list[dict[str, Any]] = []
         self.dumpers: dict[int, ACLGraphDumper] = {}
         self.trackers: dict[Any, ACLGraphAddressTracker] = {}
+        self.graph_param_updates: list[dict[str, Any]] = []
         self._orig_call: Callable | None = None
+        self._orig_update: Callable | None = None
+        self._acl_graph_mod: Any = None
         self._wrapper_cls: Any = None
+        self._pending_eager: tuple[Any, ...] | None = None
+
+    @staticmethod
+    def _extract_attn_meta_tensors(attn_meta: Any, torch: Any) -> dict[str, Any]:
+        extracted: dict[str, Any] = {}
+        items = attn_meta.values() if isinstance(attn_meta, dict) else ([attn_meta] if attn_meta is not None else [])
+        tensor_attrs = (
+            "slot_mapping",
+            "seq_lens",
+            "query_start_loc",
+            "block_table",
+            "block_tables",
+            "state_indices",
+            "conv_state_indices",
+            "ssm_state_indices",
+        )
+        for sub_meta in items:
+            if sub_meta is None:
+                continue
+            for attr in tensor_attrs:
+                val = getattr(sub_meta, attr, None)
+                if isinstance(val, torch.Tensor):
+                    extracted.setdefault(attr, val)
+            decode_meta = getattr(sub_meta, "decode", None)
+            if decode_meta is not None:
+                for attr in ("block_table", "seq_lens", "cp_seq_len"):
+                    val = getattr(decode_meta, attr, None)
+                    if isinstance(val, torch.Tensor):
+                        extracted.setdefault(f"decode.{attr}", val)
+        return extracted
+
+    def _run_eager_comparison(
+        self,
+        dumper: ACLGraphDumper,
+        runnable: Callable,
+        args: tuple[Any, ...],
+        kwargs: dict[str, Any],
+        step_idx: int,
+        fwd_ctx: Any,
+    ) -> None:
+        prev_capturing = getattr(fwd_ctx, "capturing", None) if fwd_ctx is not None else None
+        prev_mode = getattr(fwd_ctx, "cudagraph_runtime_mode", None) if fwd_ctx is not None else None
+        extra_ctx = None
+        prev_extra_capturing = None
+        try:
+            from vllm.config import CUDAGraphMode
+            from vllm_ascend.ascend_forward_context import _EXTRA_CTX
+            extra_ctx = _EXTRA_CTX
+            prev_extra_capturing = getattr(extra_ctx, "capturing", False)
+            if fwd_ctx is not None:
+                fwd_ctx.capturing = False
+                fwd_ctx.cudagraph_runtime_mode = CUDAGraphMode.NONE
+            extra_ctx.capturing = False
+        except Exception:
+            pass
+        try:
+            diff = dumper.compare_with_eager(
+                runnable,
+                *args,
+                step_index=step_idx,
+                atol=self.atol,
+                rtol=self.rtol,
+                **kwargs,
+            )
+            self.layer_diffs.append(diff)
+        finally:
+            if fwd_ctx is not None:
+                if prev_capturing is not None:
+                    fwd_ctx.capturing = prev_capturing
+                if prev_mode is not None:
+                    fwd_ctx.cudagraph_runtime_mode = prev_mode
+            if extra_ctx is not None and prev_extra_capturing is not None:
+                extra_ctx.capturing = prev_extra_capturing
 
     def attach(self) -> ACLGraphVllmInspector:
         try:
+            import vllm_ascend.compilation.acl_graph as acl_graph_mod
             from vllm_ascend.compilation.acl_graph import ACLGraphWrapper
         except ImportError:
             return self
         if self._orig_call is not None:
             return self
+        self._acl_graph_mod = acl_graph_mod
         self._wrapper_cls = ACLGraphWrapper
         self._orig_call = ACLGraphWrapper.__call__
+        self._orig_update = getattr(acl_graph_mod, "update_full_graph_params", None)
         inspector = self
         orig_call = self._orig_call
+        orig_update = self._orig_update
 
         def _wrapped_call(wrapper_self, *args, **kwargs):
             torch = _require_torch()
@@ -493,10 +573,19 @@ class ACLGraphVllmInspector:
                 fwd_ctx = get_forward_context()
                 batch_desc = getattr(fwd_ctx, "batch_descriptor", None)
                 attn_meta = getattr(fwd_ctx, "attn_metadata", None)
+                runtime_mode = getattr(fwd_ctx, "cudagraph_runtime_mode", None)
             except Exception:
                 fwd_ctx = None
                 batch_desc = None
                 attn_meta = None
+                runtime_mode = None
+
+            wrapper_mode = getattr(wrapper_self, "runtime_mode", None)
+            if runtime_mode is not None and (
+                getattr(runtime_mode, "name", None) == "NONE"
+                or (wrapper_mode is not None and runtime_mode != wrapper_mode)
+            ):
+                return orig_call(wrapper_self, *args, **kwargs)
 
             entries = getattr(wrapper_self, "concrete_aclgraph_entries", {})
             entry = entries.get(batch_desc) if batch_desc is not None else None
@@ -521,17 +610,7 @@ class ACLGraphVllmInspector:
             for k, v in kwargs.items():
                 if isinstance(v, torch.Tensor):
                     meta_dict[f"kw_{k}"] = v
-            if isinstance(attn_meta, dict):
-                for sub_meta in attn_meta.values():
-                    for attr in ("slot_mapping", "seq_lens", "query_start_loc"):
-                        val = getattr(sub_meta, attr, None)
-                        if isinstance(val, torch.Tensor):
-                            meta_dict.setdefault(attr, val)
-            elif attn_meta is not None:
-                for attr in ("slot_mapping", "seq_lens", "query_start_loc"):
-                    val = getattr(attn_meta, attr, None)
-                    if isinstance(val, torch.Tensor):
-                        meta_dict[attr] = val
+            meta_dict.update(inspector._extract_attn_meta_tensors(attn_meta, torch))
 
             tracker = inspector.trackers.setdefault(batch_desc, ACLGraphAddressTracker())
             if is_capturing:
@@ -559,24 +638,43 @@ class ACLGraphVllmInspector:
                 step_idx = int(dumper.step_counter.detach().cpu().item()) % dumper.max_steps
             out = orig_call(wrapper_self, *args, **kwargs)
             if dumper is not None and inspector.compare_eager and callable(runnable):
-                diff = dumper.compare_with_eager(
-                    runnable,
-                    *args,
-                    step_index=step_idx,
-                    atol=inspector.atol,
-                    rtol=inspector.rtol,
-                    **kwargs,
+                gp = acl_graph_mod.get_graph_params()
+                has_pending_events = bool(
+                    gp is not None
+                    and padded_tokens is not None
+                    and gp.events.get(padded_tokens)
+                    and not getattr(wrapper_self, "enable_enpu", False)
                 )
-                inspector.layer_diffs.append(diff)
+                if has_pending_events:
+                    inspector._pending_eager = (dumper, runnable, args, kwargs, step_idx, fwd_ctx)
+                else:
+                    inspector._run_eager_comparison(dumper, runnable, args, kwargs, step_idx, fwd_ctx)
             return out
 
+        def _wrapped_update(attn_backend, update_stream, forward_context, num_tokens, vllm_config, *u_args, **u_kwargs):
+            inspector.graph_param_updates.append({"num_tokens": int(num_tokens)})
+            res = orig_update(
+                attn_backend, update_stream, forward_context, num_tokens, vllm_config, *u_args, **u_kwargs
+            )
+            if inspector._pending_eager is not None:
+                dumper, runnable, p_args, p_kwargs, step_idx, fwd_ctx = inspector._pending_eager
+                inspector._pending_eager = None
+                inspector._run_eager_comparison(dumper, runnable, p_args, p_kwargs, step_idx, fwd_ctx)
+            return res
+
         ACLGraphWrapper.__call__ = _wrapped_call
+        if orig_update is not None:
+            acl_graph_mod.update_full_graph_params = _wrapped_update
         return self
 
     def close(self) -> None:
         if self._wrapper_cls is not None and self._orig_call is not None:
             self._wrapper_cls.__call__ = self._orig_call
             self._orig_call = None
+        if self._acl_graph_mod is not None and self._orig_update is not None:
+            self._acl_graph_mod.update_full_graph_params = self._orig_update
+            self._orig_update = None
+        self._pending_eager = None
         for dumper in self.dumpers.values():
             dumper.close()
         self.dumpers.clear()
