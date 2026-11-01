@@ -139,23 +139,31 @@ def _audit_file(path: Path) -> list[dict[str, Any]]:
         # 5. RoutedExpertsCapturer.capture writing TP-sharded topk_ids directly when dp_metadata is None
         if node.name == "capture" and "device_buffer" in fn_src and "topk_ids" in fn_src:
             has_dp_none_tp_gather = False
+            unconditional_extra_ctx_in_dp_none = False
             for sub in ast.walk(node):
                 if isinstance(sub, ast.If) and "dp_metadata is None" in _unparse(sub.test):
                     branch_src = "\n".join(_unparse(stmt) for stmt in sub.body)
                     if "all_gather" in branch_src or "_all_gather" in branch_src or "tp_size" in branch_src:
                         has_dp_none_tp_gather = True
-            if not has_dp_none_tp_gather and "dp_metadata is None" in fn_src:
+                    for stmt in sub.body:
+                        stmt_src = _unparse(stmt)
+                        if "_EXTRA_CTX" in stmt_src and not (
+                            isinstance(stmt, ast.If) and "tp_size" in _unparse(stmt.test)
+                        ):
+                            unconditional_extra_ctx_in_dp_none = True
+            if (not has_dp_none_tp_gather or unconditional_extra_ctx_in_dp_none) and "dp_metadata is None" in fn_src:
                 findings.append({
                     "rule": "PARTIAL_BUFFER_WRITE_UNDER_TP_SHARDING",
                     "file": str(path),
                     "line": node.lineno,
                     "function": node.name,
                     "detail": (
-                        "When `ctx.dp_metadata is None` (DP == 1) and `tp_size > 1` with ALLTOALL / MC2 / FUSED_MC2, "
+                        "When `ctx.dp_metadata is None` (DP == 1) and `self.tp_size > 1` with ALLTOALL / MC2 / FUSED_MC2, "
                         "`topk_ids` is TP-sharded (`num_tokens // tp_size` rows). Writing `topk_ids` directly into "
                         "`self.device_buffer[:batch_size, layer_id, :]` leaves upper rows `[num_tokens // tp_size : num_tokens]` "
-                        "unwritten (zeros or stale warmup batch data during ACLGraph replay). Gather `topk_ids` across "
-                        "`get_tp_group().all_gather(topk_ids, 0)` and slice to `[:num_tokens]` before writing."
+                        "unwritten (zeros or stale warmup batch data during ACLGraph replay). Guard `_EXTRA_CTX` access strictly "
+                        "inside `if self.tp_size > 1:` (do not read `_EXTRA_CTX` when `self.tp_size == 1`), gather `topk_ids` "
+                        "across `get_tp_group().device_group` / `all_gather`, and slice to `[:num_tokens]` before writing."
                     ),
                 })
 
