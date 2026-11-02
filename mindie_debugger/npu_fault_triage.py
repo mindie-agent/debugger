@@ -378,19 +378,31 @@ _MODEL_FAULT_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("msmodelslim_quant_weight_or_scale_mismatch", re.compile(
         r"msmodelslim|modelslim|compressed[-_]tensors|quant_model_description|weight_scale|input_scale|dequant_scale|quant_scale|anti_outlier|"
         r"UnquantizedLinearMethod|AscendW8A8|AscendW4A8|w8a8_dynamic|w4a8_dynamic", re.IGNORECASE)),
+    ("xllm_service_etcd_or_mooncake_rpc_timeout", re.compile(
+        r"xllm[-_]service.*(?:etcd|mooncake|rpc|brpc|timeout|unreachable)|(?:etcd|mooncake)\s+rpc\s+timeout.*xllm", re.IGNORECASE)),
     ("mooncake_or_kv_pool_transfer_fault", re.compile(
         r"mooncake|MooncakeConnector|MooncakeLayerwiseConnector|\bhixl\b|lmcache|llm[-_]datadist|kv_transfer|kv_connector|kv_producer|kv_consumer|"
         r"register_memory|ibv_reg_mr|cp_kv_cache_interleave_size", re.IGNORECASE)),
+    ("xllm_custom_op_vendor_or_revision_mismatch", re.compile(
+        r"Incomplete\s+NPU\s+operator\s+vendor|NPU\s+operator\s+revision\s+mismatch|vendors/custom_xllm_math|\.xllm_ops_git_head|"
+        r"libcust_opapi\.so.*(?:cannot\s+open|not\s+found|missing|LD_LIBRARY_PATH|DT_RPATH)", re.IGNORECASE)),
+    ("xllm_xtensor_vmm_allocation_failure", re.compile(
+        r"(?:xTensor|shared_vmm_allocator|PhyPagePool).*(?:alloc|map|reserve|vmm|page|oom|fail|exhaust)|vmm\s+allocation\s+fail", re.IGNORECASE)),
+    ("mindie_sd_custom_opp_or_plugin_so_missing", re.compile(
+        r"libPTAExtensionOPS\.so|libpta_extend\.so|find_op_path|mindiesd/plugin|vendors/(?:mindie_sd|customize|aie_ascendc|customize_transformer)|fla_npu_opp_env\.pth|mindiesd.*set_env\.sh", re.IGNORECASE)),
+    ("mindie_sd_sparse_attention_or_mxfp4_alignment_fault", re.compile(
+        r"MIE-ATN-|MIE-QNT-|aclnnBlockSparseAttention|AdaBlockSparseAttention|EagleQuantBlockSparseAttention|"
+        r"(?:RainFusion|Ada[-_]?BSA|EagleQBSA|Laurel).*(?:tiling|align|shape|rank)|quant_four_over_six_a5|W4A4_MXFP4|MXFP4.*(?:align|shape|tiling|group)", re.IGNORECASE)),
+    ("mindie_sd_usp_hybrid_parallel_or_vae_oom_fault", re.compile(
+        r"MIE-USP-|USPShapeError|USPTopologyError|number\s+of\s+q\s+heads\s+must\s+be\s+divisible\s+by|ulysses_group|"
+        r"(?:CausalVAE|WanVAE|enable_vae_tiling|enable_vae_slicing).*(?:oom|out\s+of\s+memory|alloc|fail|tile|slice)", re.IGNORECASE)),
     ("custom_op_abi_or_symbol_shadowing", re.compile(
         r"_C_ascend|libascend_kernels\.so|ACLNN_ERR_PARAM_NULLPTR|\b161001\b|\b561000\b|\b561103\b|"
-        r"opapi_math|undef(?:ined)?\s+symbol.*aclnn|NotImplementedError.*Meta|dispatch\s+key.*Meta|"
-        r"errcode\s*[:=]?\s*264|tiling\s+offset\s+out\s+of\s+range", re.IGNORECASE)),
+        r"opapi_math|undef(?:ined)?\s+symbol.*aclnn|NotImplementedError.*Meta|dispatch\s+key.*Meta|errcode\s*[:=]?\s*264|tiling\s+offset\s+out\s+of\s+range", re.IGNORECASE)),
     ("multithread_npu_context_or_rogue_device0", re.compile(
-        r"\b107003\b|ACL_ERROR_RT_CONTEXT_NULL|context\s+is\s+null|aclrtSetDevice.*device\s*0|"
-        r"rogue\s+device\s*0|ThreadPoolExecutor.*set_device", re.IGNORECASE)),
+        r"\b107003\b|ACL_ERROR_RT_CONTEXT_NULL|context\s+is\s+null|aclrtSetDevice.*device\s*0|rogue\s+device\s*0|ThreadPoolExecutor.*set_device", re.IGNORECASE)),
     ("enginecore_shm_or_zmq_frame_corruption", re.compile(
-        r"shm_broadcast|multiproc_executor.*(?:EOFError|UnpicklingError|corrupt)|"
-        r"EngineCore.*(?:ZMQ|hang|deadlock)|MessageQueue.*(?:chunk|corrupt|timeout)", re.IGNORECASE)),
+        r"shm_broadcast|multiproc_executor.*(?:EOFError|UnpicklingError|corrupt)|EngineCore.*(?:ZMQ|hang|deadlock)|MessageQueue.*(?:chunk|corrupt|timeout)", re.IGNORECASE)),
     ("numerical_nan_inf_or_determinism_drift", re.compile(
         r"\bnan\b|\binf(?:inity)?\b|precision\s+(?:drift|drop|mismatch)|cosine\s+similarity|kl\s+divergence|"
         r"non[-_]?deterministic|determinism\s+drift|gnorm\s+spike|loss\s+spike|HCCL_DETERMINISTIC|LCCL_DETERMINISTIC|VLLM_BATCH_INVARIANT|msprobe", re.IGNORECASE)),
@@ -463,6 +475,30 @@ MODEL_FAULT_REMEDIATIONS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             "Check whether a rank worker crashed or emitted oversized/misaligned SchedulerOutput frames across MessageQueue shared memory.",
         ),
     ),
+    "xllm_custom_op_vendor_or_revision_mismatch": (("ldd", "readelf", "ASCEND_OPP_PATH", "LD_LIBRARY_PATH", "asys"), (
+        "Verify $ASCEND_OPP_PATH/vendors/custom_xllm_math/.xllm_ops_git_head matches the third_party/xllm_ops submodule revision expected by xllm; rebuild and reinstall xllm_ops when hitting Incomplete NPU operator vendor or NPU operator revision mismatch.",
+        "Prepend $ASCEND_OPP_PATH/vendors/custom_xllm_math/op_api/lib to LD_LIBRARY_PATH (and inspect DT_RPATH / RUNPATH with `readelf -d`) so libcust_opapi.so resolves cleanly at runtime.",
+    )),
+    "xllm_xtensor_vmm_allocation_failure": (("npu-smi", "asys", "msnpureport"), (
+        "Lower --max_memory_utilization or KV cache physical page reservation so xTensor (shared_vmm_allocator / PhyPagePool) does not exhaust NPU physical VMM pages.",
+        "Inspect `npu-smi info` and `dmesg | grep -i svm` for leaked devmm_svm virtual memory mappings before relaunching xllm.",
+    )),
+    "xllm_service_etcd_or_mooncake_rpc_timeout": (("etcdctl", "hccn_tool", "HCCL_SOCKET_IFNAME", "asys"), (
+        "Check etcd lease and endpoint health (`etcdctl endpoint health`) and verify xllm-service brpc / Mooncake transfer ports are reachable between scheduler and worker nodes.",
+        "Align HCCL_SOCKET_IFNAME, GLOO_SOCKET_IFNAME, and Mooncake RDMA NIC bindings across Prefill, Decode, and EPD instances.",
+    )),
+    "mindie_sd_custom_opp_or_plugin_so_missing": (("ldd", "ASCEND_CUSTOM_OPP_PATH", "LD_LIBRARY_PATH", "FLA_NPU_DISABLE_PTH=1", "asys"), (
+        "Source mindiesd/set_env.sh and export ASCEND_CUSTOM_OPP_PATH=<cann>/opp/vendors/customize:<cann>/opp/vendors/aie_ascendc:<cann>/opp/vendors/customize_transformer:$ASCEND_CUSTOM_OPP_PATH (and export FLA_NPU_DISABLE_PTH=1 if fla_npu_opp_env.pth overwrites ASCEND_CUSTOM_OPP_PATH).",
+        "Ensure mindiesd/plugin/libPTAExtensionOPS.so (or libpta_extend.so) is present and its CANN/PyTorch dependencies resolve on LD_LIBRARY_PATH so torch.ops.mindiesd loads cleanly.",
+    )),
+    "mindie_sd_sparse_attention_or_mxfp4_alignment_fault": (("ASCEND_LAUNCH_BLOCKING=1", "msprobe", "asys", "npu-smi"), (
+        "Align sequence length and latent spatial dimensions (T, H, W) to the sparse block size (64 or 128) required by aclnnBlockSparseAttention (RainFusion / AdaBlockSparseAttention / EagleQuantBlockSparseAttention), and pass actual_seq_lengths=None to aclnnSparseBlockEstimate on Atlas A5 (DAV_3510).",
+        "For W4A4_MXFP4 / quant_four_over_six_a5 (aclnnQuantFourOverSixA5V2, MIE-QNT-) or Laurel alignment errors in MindIE-SD, ensure Atlas A5 (Ascend950) SoC with dst_type_max=4.0 and group_size=32 alignment (or fallback unaligned layers to W8A8 / BF16).",
+    )),
+    "mindie_sd_usp_hybrid_parallel_or_vae_oom_fault": (("HCCL_ENTRY_LOG_ENABLE=1", "npu-smi", "asys"), (
+        "Ensure ulysses_degree * ring_degree * cfg_degree * tp_degree == world_size (MIE-USP-002) and num_q_heads % ulysses_degree == 0 (MIE-USP-001) for MindIE-SD USP hybrid sequence parallelism.",
+        "For 3D CausalVAE / WanVAE decode OOMs, enable `pipe.enable_vae_tiling()` and `pipe.enable_vae_slicing()` to bound peak spatial-temporal activation memory.",
+    )),
 }
 MODEL_FAULT_CATEGORIES = tuple(MODEL_FAULT_REMEDIATIONS.keys())
 
@@ -485,35 +521,32 @@ def _parse_line(line: str, index: int) -> dict[str, Any]:
         for token in (
             "error", "fail", "exception", "timeout", "hang", "deadlock", "mismatch",
             "hazard", "race", "break", "abort", "nan", "inf", "overflow", "drift",
-            "spike", "missing", "incompatible", "exhaust",
+            "spike", "missing", "incompatible", "exhaust", "incomplete", "align",
+            "divisible", "not found", "cannot open", "mie-", "oom",
         )
     )
     is_error = (
-        bool(ERROR_RE.search(line))
-        or ("error" in lowered and bool(codes))
+        bool(ERROR_RE.search(line)) or ("error" in lowered and bool(codes))
         or (bool(sync_ind) and (has_failure_word or bool(codes)))
         or (bool(graph_stg) and (has_failure_word or bool(codes)))
         or (bool(model_cat) and (has_failure_word or bool(codes)))
     )
     timeout = bool(TIMEOUT_RE.search(line)) or any(code in {"EI0002", "EI0006"} for code in codes)
     moment, raw_time = _timestamp(line)
+    pid_match = PID_TID_RE.search(line)
     return {
-        "index": index, "line": line, "codes": codes, "is_error": is_error,
-        "timeout": timeout, "moment": moment, "timestamp": raw_time,
-        "pid": PID_TID_RE.search(line).group(1) if PID_TID_RE.search(line) else None,
-        "tid": PID_TID_RE.search(line).group(2) if PID_TID_RE.search(line) else None,
-        "rank": _first_int(RANK_RE, line), "device_id": _first_int(DEVICE_RE, line),
-        "stream_id": _first_int(STREAM_RE, line), "task_id": _first_int(TASK_RE, line),
-        "operator": _operator(line), "bitmask": _bitmask(line),
-        "subunits": _subunits(line), "sync_indicators": sync_ind,
-        "graph_stages": graph_stg, "model_fault_category": model_cat,
+        "index": index, "line": line, "codes": codes, "is_error": is_error, "timeout": timeout,
+        "moment": moment, "timestamp": raw_time, "pid": pid_match.group(1) if pid_match else None,
+        "tid": pid_match.group(2) if pid_match else None, "rank": _first_int(RANK_RE, line),
+        "device_id": _first_int(DEVICE_RE, line), "stream_id": _first_int(STREAM_RE, line),
+        "task_id": _first_int(TASK_RE, line), "operator": _operator(line), "bitmask": _bitmask(line),
+        "subunits": _subunits(line), "sync_indicators": sync_ind, "graph_stages": graph_stg,
+        "model_fault_category": model_cat,
     }
 
 
 def _score(parsed: dict[str, Any]) -> int:
-    codes = parsed["codes"]
-    line = parsed["line"]
-    score = 0
+    codes, line, score = parsed["codes"], parsed["line"], 0
     if any(code in {"507015", "507035", "507014"} for code in codes):
         score += 120
     if any(code in {"507001", "507033", "EL0004", "E80000", "E89999", "EH0010"} for code in codes):
@@ -538,32 +571,24 @@ def _score(parsed: dict[str, Any]) -> int:
         score += 45
     if NUMERIC_RE.search(line):
         score += 30
-    if parsed["timeout"] and not parsed.get("model_fault_category"):
-        score += 5
-    else:
-        score += 20
+    score += 5 if (parsed["timeout"] and not parsed.get("model_fault_category")) else 20
     return score
 
 
 def _domain(
-    root: dict[str, Any],
-    codes: list[str],
-    bitmask: int | None,
-    sync_indicators: list[str],
-    graph_stages: list[str],
-    model_fault_category: str | None = None,
+    root: dict[str, Any], codes: list[str], bitmask: int | None,
+    sync_indicators: list[str], graph_stages: list[str], model_fault_category: str | None = None,
 ) -> str:
     line = root["line"] if root else ""
     root_codes = root.get("codes") or codes
-    hccl_codes = any(
-        code in {"EI0002", "EI0004", "EI0006", "EI0009", "EI0010", "EI0012", "EI0013", "EI0018"}
-        for code in root_codes
-    )
+    hccl_codes = any(code in {"EI0002", "EI0004", "EI0006", "EI0009", "EI0010", "EI0012", "EI0013", "EI0018"} for code in root_codes)
     if sync_indicators and not any(code in {"507015", "507035"} for code in root_codes):
         return "ascendc_sync_or_pipe_hazard"
-    if any(code in {"507015", "507035", "507014", "EZ9999", "EZ2001"} for code in root_codes):
+    if any(code in {"507015", "507035", "507014", "EZ2001"} or (code == "EZ9999" and not model_fault_category) for code in root_codes):
         return "aicore_memory_or_tiling"
-    if any(code in {"EL0004", "E80000", "E89999", "EH0010", "207001", "507001", "507033"} for code in root_codes):
+    if any(code in {"EL0004", "E80000", "E89999", "EH0010", "207001", "507001", "507033"} for code in root_codes) and model_fault_category not in {
+        "xllm_xtensor_vmm_allocation_failure", "mindie_sd_usp_hybrid_parallel_or_vae_oom_fault"
+    }:
         return "device_oom_or_driver"
     if model_fault_category:
         return model_fault_category
@@ -573,11 +598,7 @@ def _domain(
         return "aicore_memory_or_tiling"
     if OOM_RE.search(line):
         return "device_oom_or_driver"
-    if (
-        any(code in {"107002", "EZ3002", "EZ1013", "E10009", "E19999"} for code in root_codes)
-        or GRAPH_RE.search(line)
-        or graph_stages
-    ):
+    if any(code in {"107002", "EZ3002", "EZ1013", "E10009", "E19999"} for code in root_codes) or GRAPH_RE.search(line) or graph_stages:
         return "aclgraph_capture_or_stream"
     if any(code in {"EE8888", "EE9999", "EE1002", "507046"} for code in root_codes):
         return "runtime_stream_or_event"
@@ -589,11 +610,8 @@ def _domain(
 
 
 def _tools_for_triage(
-    codes: list[str],
-    fault_domain: str,
-    sync_indicators: list[str],
-    graph_stages: list[str],
-    model_fault_category: str | None = None,
+    codes: list[str], fault_domain: str, sync_indicators: list[str],
+    graph_stages: list[str], model_fault_category: str | None = None,
 ) -> list[str]:
     tools: list[str] = []
     for cat in (model_fault_category, fault_domain):
@@ -628,11 +646,8 @@ def _tools_for_triage(
 
 
 def _actions(
-    codes: list[str],
-    fault_domain: str,
-    sync_indicators: list[str] = (),
-    graph_stages: list[str] = (),
-    model_fault_category: str | None = None,
+    codes: list[str], fault_domain: str, sync_indicators: list[str] = (),
+    graph_stages: list[str] = (), model_fault_category: str | None = None,
 ) -> list[str]:
     actions: list[str] = []
     for cat in (model_fault_category, fault_domain):
@@ -708,23 +723,11 @@ def triage_ascend_plog(plog_text: str) -> dict[str, Any]:
 
     cascades = [item for item in parsed if item["timeout"] and after_root(item)]
     codes = list(dict.fromkeys(root["codes"] + [code for item in parsed for code in item["codes"]]))
-    bitmask = root["bitmask"]
-    if bitmask is None:
-        for item in parsed:
-            if item["bitmask"] is not None:
-                bitmask = item["bitmask"]
-                break
+    bitmask = root["bitmask"] if root["bitmask"] is not None else next((item["bitmask"] for item in parsed if item["bitmask"] is not None), None)
     subunits = list(dict.fromkeys(root["subunits"] + [sub for item in parsed for sub in item["subunits"]]))
-    sync_indicators = list(dict.fromkeys(
-        root["sync_indicators"] + [ind for item in parsed for ind in item["sync_indicators"]]
-    ))
-    graph_stages = list(dict.fromkeys(
-        root["graph_stages"] + [stg for item in parsed for stg in item["graph_stages"]]
-    ))
-    model_cat = root.get("model_fault_category") or next(
-        (item["model_fault_category"] for item in parsed if item.get("model_fault_category")),
-        None,
-    )
+    sync_indicators = list(dict.fromkeys(root["sync_indicators"] + [ind for item in parsed for ind in item["sync_indicators"]]))
+    graph_stages = list(dict.fromkeys(root["graph_stages"] + [stg for item in parsed for stg in item["graph_stages"]]))
+    model_cat = root.get("model_fault_category") or next((item["model_fault_category"] for item in parsed if item.get("model_fault_category")), None)
     domain = _domain(root, codes, bitmask, sync_indicators, graph_stages, model_cat)
     if model_cat is None and domain == "aclgraph_capture_or_stream":
         model_cat = "vllm_ascend_aclgraph_capture_failure"
@@ -736,11 +739,7 @@ def triage_ascend_plog(plog_text: str) -> dict[str, Any]:
     operator = root["operator"] or next((item["operator"] for item in parsed if item["operator"]), None)
     actions = _actions(codes, domain, sync_indicators, graph_stages, model_cat)
     tools = _tools_for_triage(codes, domain, sync_indicators, graph_stages, model_cat)
-    primary_detail = (
-        decoded[0]["summary"]
-        if decoded
-        else (model_cat or (", ".join(sync_indicators) if sync_indicators else (", ".join(graph_stages) if graph_stages else "unclassified error")))
-    )
+    primary_detail = decoded[0]["summary"] if decoded else (model_cat or (", ".join(sync_indicators) if sync_indicators else (", ".join(graph_stages) if graph_stages else "unclassified error")))
     summary = f"{domain}: {primary_detail}"
     if subunits:
         summary += f" Subunits: {', '.join(subunits)}."
@@ -775,21 +774,11 @@ def triage_ascend_plog(plog_text: str) -> dict[str, Any]:
 
 
 def triage_npu_fault(plog_text: str) -> dict[str, Any]:
-    """Public alias for the Ascend plog root-cause classifier.
-
-    ``triage_ascend_plog`` remains the descriptive implementation name.  The
-    shorter public spelling is stable for release benchmarks and downstream
-    integrations that triage a mix of HCCL, driver and device faults.
-    """
+    """Public alias for the Ascend plog root-cause classifier."""
     return triage_ascend_plog(plog_text)
 
 
 __all__ = [
-    "CANN_CODES",
-    "MODEL_FAULT_CATEGORIES",
-    "MODEL_FAULT_REMEDIATIONS",
-    "RTS_CODES",
-    "decode_cann_error_code",
-    "triage_ascend_plog",
-    "triage_npu_fault",
+    "CANN_CODES", "MODEL_FAULT_CATEGORIES", "MODEL_FAULT_REMEDIATIONS",
+    "RTS_CODES", "decode_cann_error_code", "triage_ascend_plog", "triage_npu_fault",
 ]

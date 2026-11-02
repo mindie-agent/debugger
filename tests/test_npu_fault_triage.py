@@ -401,8 +401,88 @@ def test_live_process_env_audit_and_runtime_guard_funnel(tmp_path, monkeypatch):
     assert "summary_mode" in steps_joined
 
     # Offline --text triage must NOT attach a local /proc/<pid> audit when --pid was not requested
-    import json
     from mindie_debugger.cli import main
 
     rc_text = main(["triage", "--text", "[ERROR] RUNTIME(4242,4243):2020-01-01-00:00:00.000.000 ErrCode=507015"])
     assert rc_text == 0
+
+
+def test_xllm_and_mindie_sd_fault_categories_and_remediations():
+    vendor_res = triage_ascend_plog(
+        "[ERROR] XLLM(9801,9802):2026-11-02-19:00:00.000.000 "
+        "rank[0] deviceId:0 NPU operator revision mismatch in "
+        "vendors/custom_xllm_math/.xllm_ops_git_head and libcust_opapi.so missing from LD_LIBRARY_PATH"
+    )
+    assert vendor_res["fault_domain"] == "xllm_custom_op_vendor_or_revision_mismatch"
+    assert vendor_res["model_fault_category"] == "xllm_custom_op_vendor_or_revision_mismatch"
+    assert any(".xllm_ops_git_head" in step for step in vendor_res["remediation_steps"])
+    assert any("libcust_opapi.so" in step for step in vendor_res["remediation_steps"])
+
+    xtensor_res = triage_ascend_plog(
+        "[ERROR] XLLM(9811,9812):2026-11-02-19:01:00.000.000 "
+        "rank[0] deviceId:1 shared_vmm_allocator xTensor physical page map failed: "
+        "aclrtMallocPhysical / aclrtMapMem out of physical pages"
+    )
+    assert xtensor_res["fault_domain"] == "xllm_xtensor_vmm_allocation_failure"
+    assert xtensor_res["model_fault_category"] == "xllm_xtensor_vmm_allocation_failure"
+    assert any("shared_vmm_allocator" in step for step in xtensor_res["remediation_steps"])
+
+    xllm_service_res = triage_ascend_plog(
+        "[ERROR] XLLM_SERVICE(9821,9822):2026-11-02-19:02:00.000.000 "
+        "rank[0] deviceId:0 xllm_service EPD disaggregation etcd lease expired and "
+        "Mooncake RPC pull_kv timeout"
+    )
+    assert xllm_service_res["fault_domain"] == "xllm_service_etcd_or_mooncake_rpc_timeout"
+    assert xllm_service_res["model_fault_category"] == "xllm_service_etcd_or_mooncake_rpc_timeout"
+    assert "etcdctl" in xllm_service_res["recommended_tools"]
+
+    mindie_sd_res = triage_ascend_plog(
+        "[ERROR] MINDIE_SD(9831,9832):2026-11-02-19:03:00.000.000 "
+        "rank[0] deviceId:0 aclnnBlockSparseAttention RainFusion tiling failed and "
+        "W4A4_MXFP4 group_size=32 alignment error"
+    )
+    assert mindie_sd_res["fault_domain"] == "mindie_sd_sparse_attention_or_mxfp4_alignment_fault"
+    assert mindie_sd_res["model_fault_category"] == "mindie_sd_sparse_attention_or_mxfp4_alignment_fault"
+    assert any("aclnnBlockSparseAttention" in step for step in mindie_sd_res["remediation_steps"])
+    assert any("W4A4_MXFP4" in step for step in mindie_sd_res["remediation_steps"])
+
+    # Generic 561000 / EZ9999 codes do not shadow specific xLLM or MindIE-SD fault categories
+    vendor_with_561000 = triage_ascend_plog(
+        "[ERROR] XLLM(9841,9842):2026-11-02-19:04:00.000.000 "
+        "rank[0] deviceId:0 ErrCode=561000, EZ9999 Incomplete NPU operator vendor in "
+        "vendors/custom_xllm_math/.xllm_ops_git_head"
+    )
+    assert vendor_with_561000["fault_domain"] == "xllm_custom_op_vendor_or_revision_mismatch"
+    assert vendor_with_561000["model_fault_category"] == "xllm_custom_op_vendor_or_revision_mismatch"
+
+    sd_with_561000 = triage_ascend_plog(
+        "[ERROR] MINDIE_SD(9851,9852):2026-11-02-19:05:00.000.000 "
+        "rank[0] deviceId:0 ErrCode=561000, EZ9999 aclnnBlockSparseAttention RainFusion tiling failed"
+    )
+    assert sd_with_561000["fault_domain"] == "mindie_sd_sparse_attention_or_mxfp4_alignment_fault"
+    assert sd_with_561000["model_fault_category"] == "mindie_sd_sparse_attention_or_mxfp4_alignment_fault"
+
+    # MindIE-SD custom opp / libpta_extend.so or libPTAExtensionOPS.so missing
+    sd_plugin_missing = triage_ascend_plog(
+        "[ERROR] MINDIE_SD(9861,9862):2026-11-02-19:06:00.000.000 "
+        "rank[0] OSError: mindiesd/plugin/libPTAExtensionOPS.so cannot open shared object file; "
+        "find_op_path failed for vendors/mindie_sd"
+    )
+    assert sd_plugin_missing["fault_domain"] == "mindie_sd_custom_opp_or_plugin_so_missing"
+    assert sd_plugin_missing["model_fault_category"] == "mindie_sd_custom_opp_or_plugin_so_missing"
+    assert any("libpta_extend.so" in step or "libPTAExtensionOPS.so" in step for step in sd_plugin_missing["remediation_steps"])
+
+    # MindIE-SD USP head divisibility / 3D CausalVAE OOM
+    sd_usp_fault = triage_ascend_plog(
+        "[ERROR] MINDIE_SD(9871,9872):2026-11-02-19:07:00.000.000 "
+        "rank[0] MIE-USP-001 USPShapeError: the number of q heads must be divisible by ulysses_group"
+    )
+    assert sd_usp_fault["fault_domain"] == "mindie_sd_usp_hybrid_parallel_or_vae_oom_fault"
+    assert sd_usp_fault["model_fault_category"] == "mindie_sd_usp_hybrid_parallel_or_vae_oom_fault"
+    assert any("enable_vae_tiling" in step for step in sd_usp_fault["remediation_steps"])
+
+    sd_vae_oom = triage_ascend_plog(
+        "[ERROR] MINDIE_SD(9881,9882):2026-11-02-19:08:00.000.000 "
+        "rank[0] deviceId:0 ErrCode=E80000 WanVAE / CausalVAE decode out of memory; call enable_vae_tiling"
+    )
+    assert sd_vae_oom["fault_domain"] == "mindie_sd_usp_hybrid_parallel_or_vae_oom_fault"
