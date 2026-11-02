@@ -380,16 +380,8 @@ class ACLGraphDumper:
 
     def _slots_init_for(self, name: str) -> None:
         torch = _require_torch()
-        self._slots[name] = torch.zeros(
-            (self.max_steps, self.max_snapshot_numel),
-            dtype=torch.float32,
-            device=self.device,
-        )
-        self._scratch[name] = torch.zeros(
-            (self.max_snapshot_numel,),
-            dtype=torch.float32,
-            device=self.device,
-        )
+        self._slots[name] = torch.zeros((self.max_steps, self.max_snapshot_numel), dtype=torch.float32, device=self.device)
+        self._scratch[name] = torch.zeros((self.max_snapshot_numel,), dtype=torch.float32, device=self.device)
 
     def _make_hook(self, name: str) -> Callable:
         torch = _require_torch()
