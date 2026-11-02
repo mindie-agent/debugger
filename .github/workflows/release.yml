@@ -1,0 +1,19 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    uses: mindie-agent/mindie-bench/.github/workflows/publish-release.yml@484b80621aaf9293c559786d0ef2174c79a0dbb4
+    with:
+      release-notes-path: docs/releases/mindie-debugger-0.1.0.md
+      benchmark-ref: 484b80621aaf9293c559786d0ef2174c79a0dbb4
+      setup-command: |
+        uv venv --python 3.13 && uv pip install -e ".[test]"
+      test-command: |
+        .venv/bin/python -m pytest -q -m "not live_npu"
