@@ -460,6 +460,79 @@ def _read_bounded_log_text(path: Path, max_bytes: int = 4 * 1024 * 1024) -> str:
     return head + "\n...[truncated middle of large plog]...\n" + tail
 
 
+_CRITICAL_ASCEND_ENV_KEYS = (
+    "ASCEND_TOOLKIT_HOME",
+    "ATB_HOME_PATH",
+    "HCCL_DETERMINISTIC",
+    "LCCL_DETERMINISTIC",
+    "VLLM_BATCH_INVARIANT",
+    "ASCEND_LAUNCH_BLOCKING",
+    "PYTORCH_NPU_ALLOC_CONF",
+)
+
+
+def _inspect_live_process_env(pid: int | None, proc_root: Path | None = None) -> dict[str, Any] | None:
+    """Compare live /proc/<pid>/environ and /proc/<pid>/maps against the current shell environment."""
+    if pid is None or int(pid) <= 0:
+        return None
+    root = proc_root if proc_root is not None else Path("/proc")
+    proc_dir = root / str(int(pid))
+    env_file = proc_dir / "environ"
+    maps_file = proc_dir / "maps"
+    if not env_file.is_file():
+        return None
+    try:
+        with env_file.open("rb") as fh:
+            raw_env = fh.read(256 * 1024)
+    except TimeoutError:
+        raise
+    except OSError:
+        return None
+    proc_env: dict[str, str] = {}
+    for item in raw_env.split(b"\x00"):
+        if b"=" in item:
+            k, _, v = item.decode("utf-8", errors="replace").partition("=")
+            proc_env[k] = v
+    drift: dict[str, dict[str, str | None]] = {}
+    selected_env: dict[str, str] = {}
+    for key in _CRITICAL_ASCEND_ENV_KEYS:
+        p_val = proc_env.get(key)
+        s_val = os.environ.get(key)
+        if p_val is not None:
+            selected_env[key] = p_val
+        if p_val != s_val:
+            drift[key] = {"process_value": p_val, "shell_value": s_val}
+    cann_so_paths: list[str] = []
+    if maps_file.is_file():
+        try:
+            with maps_file.open("rb") as fh:
+                maps_text = fh.read(1024 * 1024).decode("utf-8", errors="replace")
+            seen_so: set[str] = set()
+            for line in maps_text.splitlines():
+                parts = line.split(None, 5)
+                if len(parts) < 6:
+                    continue
+                so_path = parts[5].strip()
+                if ".so" in so_path and any(
+                    tok in so_path.lower() for tok in ("ascend", "cann", "atb", "hccl", "_c_ascend")
+                ):
+                    if so_path not in seen_so:
+                        seen_so.add(so_path)
+                        cann_so_paths.append(so_path)
+        except TimeoutError:
+            raise
+        except OSError:
+            pass
+    return {
+        "pid": int(pid),
+        "process_env": selected_env,
+        "env_drift_against_shell": drift,
+        "has_env_drift": bool(drift),
+        "loaded_ascend_so_count": len(cann_so_paths),
+        "loaded_ascend_so_sample": cann_so_paths[:16],
+    }
+
+
 def _default_cann_log_root() -> Path | None:
     env_path = os.environ.get("ASCEND_PROCESS_LOG_PATH", "").strip()
     if env_path:
@@ -671,6 +744,9 @@ def main(argv: list[str] | None = None) -> int:
         if scanned_files:
             payload["scanned_file_count"] = len(scanned_files)
             payload["scanned_files"] = scanned_files[:16]
+        live_env = _inspect_live_process_env(args.pid or payload.get("root_cause_pid"))
+        if live_env is not None:
+            payload["live_process_env_audit"] = live_env
         payload["remote_npu_execution_guide"] = _build_remote_execution_guide(raw_argv)
         print(json.dumps(payload, ensure_ascii=True))
         return 0

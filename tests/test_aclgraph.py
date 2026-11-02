@@ -79,6 +79,28 @@ def test_aclgraph_address_tracker_catches_rebound_pointer_and_padded_slots():
     assert "rebound_pointer" in kinds
     assert "unmasked_padded_slot_mapping" in kinds
 
+    # KV bounds & block_table capacity verification (generalizing verify_request_kv)
+    active_bad_slots = torch.tensor([-1, 64, -1, -1], dtype=torch.int64)
+    block_table = torch.tensor([[0, 8, -1], [1, -1, -1]], dtype=torch.int32)
+    seq_lens = torch.tensor([20, 20], dtype=torch.int32)
+    kv_rep = tracker.verify_replay(
+        actual_tokens=2,
+        padded_tokens=4,
+        block_size=16,
+        num_blocks=4,
+        null_block_id=-1,
+        meta={
+            "slot_mapping": active_bad_slots,
+            "block_table": block_table,
+            "seq_lens": seq_lens,
+        },
+    )
+    assert kv_rep["status"] == "violation"
+    kv_kinds = {v["kind"] for v in kv_rep["violations"]}
+    assert "active_slot_out_of_bounds" in kv_kinds
+    assert "block_table_out_of_bounds" in kv_kinds
+    assert "block_table_capacity_insufficient" in kv_kinds
+
 
 class _ProjWithStaleScale(torch.nn.Module):
     def __init__(self, stale_scale_buf: torch.Tensor):

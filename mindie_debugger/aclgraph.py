@@ -39,14 +39,7 @@ from .precision.npu_watch import WatchRingBuffer
 from .precision.storage_graph import _require_torch, _storage_identity
 from .precision.tree_utils import flatten_tree_with_paths, path_to_string
 
-_SYNC_FUNC_NAMES = frozenset({
-    "item",
-    "tolist",
-    "__bool__",
-    "__index__",
-    "numpy",
-    "nonzero",
-})
+_SYNC_FUNC_NAMES = frozenset({"item", "tolist", "__bool__", "__index__", "numpy", "nonzero"})
 
 
 def _first_user_frame() -> str:
@@ -157,10 +150,24 @@ class ACLGraphAddressTracker:
         actual_tokens: int | None = None,
         padded_tokens: int | None = None,
         slot_mapping_tensor: Any = None,
+        block_table_tensor: Any = None,
+        seq_lens_tensor: Any = None,
+        block_size: int | None = None,
+        num_blocks: int | None = None,
+        null_block_id: int | None = None,
         **roots: Any,
     ) -> dict[str, Any]:
         torch = _require_torch()
         violations: list[dict[str, Any]] = []
+        meta_root = roots.get("meta") if isinstance(roots.get("meta"), dict) else {}
+        if slot_mapping_tensor is None:
+            slot_mapping_tensor = meta_root.get("slot_mapping")
+        if block_table_tensor is None:
+            block_table_tensor = meta_root.get("block_table")
+            if block_table_tensor is None:
+                block_table_tensor = meta_root.get("block_tables")
+        if seq_lens_tensor is None:
+            seq_lens_tensor = meta_root.get("seq_lens")
         for root_name, root_val in roots.items():
             for subpath, leaf in flatten_tree_with_paths(root_val):
                 if not isinstance(leaf, torch.Tensor):
@@ -190,26 +197,99 @@ class ACLGraphAddressTracker:
                         "captured_shape": list(expected["shape"]),
                         "replay_shape": list(observed_shape),
                     })
+        if slot_mapping_tensor is not None and isinstance(slot_mapping_tensor, torch.Tensor):
+            flat_slots = slot_mapping_tensor.detach().reshape(-1)
+            max_slot_limit = (
+                int(num_blocks) * int(block_size)
+                if (num_blocks is not None and block_size is not None and int(block_size) > 0)
+                else None
+            )
+            if actual_tokens is not None and int(actual_tokens) > 0:
+                act_n = int(actual_tokens)
+                active = flat_slots[:act_n]
+                shortfall = max(0, act_n - int(flat_slots.numel()))
+                unmapped = int((active < 0).sum().item())
+                oob = (
+                    (int((active >= max_slot_limit).sum().item()) if max_slot_limit is not None else 0)
+                    + shortfall
+                )
+                if unmapped > 0 or oob > 0:
+                    violations.append({
+                        "kind": "active_slot_out_of_bounds",
+                        "actual_tokens": act_n,
+                        "unmapped_active_slot_count": unmapped,
+                        "oob_active_slot_count": oob,
+                        "max_slot_limit": max_slot_limit,
+                        "hint": (
+                            "Active slot_mapping[:actual_tokens] contains negative (-1) or out-of-range "
+                            "physical KV slots, dropping written tokens or corrupting adjacent KV memory."
+                        ),
+                    })
+            if (
+                actual_tokens is not None
+                and padded_tokens is not None
+                and int(padded_tokens) > int(actual_tokens)
+            ):
+                tail = flat_slots[int(actual_tokens):int(padded_tokens)]
+                bad_slots = int((tail >= 0).sum().item())
+                if bad_slots > 0:
+                    violations.append({
+                        "kind": "unmasked_padded_slot_mapping",
+                        "actual_tokens": int(actual_tokens),
+                        "padded_tokens": int(padded_tokens),
+                        "unmasked_slot_count": bad_slots,
+                        "hint": (
+                            "Padded tail slot_mapping[actual_tokens:padded_tokens] contains non-negative "
+                            "slot IDs; fill padded slots with -1 so ACLGraph replay does not overwrite live KV/state."
+                        ),
+                    })
         if (
-            slot_mapping_tensor is not None
-            and isinstance(slot_mapping_tensor, torch.Tensor)
-            and actual_tokens is not None
-            and padded_tokens is not None
-            and int(padded_tokens) > int(actual_tokens)
+            block_table_tensor is not None
+            and isinstance(block_table_tensor, torch.Tensor)
+            and block_size is not None
+            and int(block_size) > 0
         ):
-            tail = slot_mapping_tensor.detach().reshape(-1)[int(actual_tokens):int(padded_tokens)]
-            bad_slots = int((tail >= 0).sum().item())
-            if bad_slots > 0:
-                violations.append({
-                    "kind": "unmasked_padded_slot_mapping",
-                    "actual_tokens": int(actual_tokens),
-                    "padded_tokens": int(padded_tokens),
-                    "unmasked_slot_count": bad_slots,
-                    "hint": (
-                        "Padded tail slot_mapping[actual_tokens:padded_tokens] contains non-negative "
-                        "slot IDs; fill padded slots with -1 so ACLGraph replay does not overwrite live KV/state."
-                    ),
-                })
+            bsize = int(block_size)
+            bt_2d = block_table_tensor.detach()
+            if bt_2d.dim() == 1:
+                bt_2d = bt_2d.unsqueeze(0)
+            req_lengths: list[int] = []
+            if seq_lens_tensor is not None and isinstance(seq_lens_tensor, torch.Tensor):
+                req_lengths = [int(v) for v in seq_lens_tensor.detach().reshape(-1).tolist()]
+            elif actual_tokens is not None and bt_2d.shape[0] == 1:
+                req_lengths = [int(actual_tokens)]
+            for req_idx, req_tokens in enumerate(req_lengths):
+                if req_tokens <= 0:
+                    continue
+                row = bt_2d[req_idx].reshape(-1).tolist() if req_idx < int(bt_2d.shape[0]) else []
+                valid_blocks = [
+                    int(bid) for bid in row
+                    if int(bid) >= 0 and (null_block_id is None or int(bid) != int(null_block_id))
+                ]
+                capacity = len(valid_blocks) * bsize
+                if capacity < req_tokens:
+                    violations.append({
+                        "kind": "block_table_capacity_insufficient",
+                        "request_index": req_idx,
+                        "required_tokens": req_tokens,
+                        "allocated_valid_blocks": len(valid_blocks),
+                        "block_size": bsize,
+                        "capacity_tokens": capacity,
+                        "hint": (
+                            f"Request {req_idx} requires {req_tokens} KV tokens but block_table only provides "
+                            f"{len(valid_blocks)} * {bsize} = {capacity} capacity (len(block_ids) * block_size < n_tokens)."
+                        ),
+                    })
+                if num_blocks is not None:
+                    oob_blocks = [bid for bid in valid_blocks if bid >= int(num_blocks)]
+                    if oob_blocks:
+                        violations.append({
+                            "kind": "block_table_out_of_bounds",
+                            "request_index": req_idx,
+                            "num_blocks": int(num_blocks),
+                            "oob_block_ids": oob_blocks[:8],
+                            "hint": f"block_table row {req_idx} references block_id >= num_blocks ({int(num_blocks)}).",
+                        })
         return {
             "status": "ok" if not violations else "violation",
             "bound_tensor_count": len(self._bound),
@@ -217,6 +297,9 @@ class ACLGraphAddressTracker:
             "first_violation": violations[0] if violations else None,
             "violations": violations,
         }
+
+    record_capture = bind_capture_inputs
+    verify_replay = verify_replay_inputs
 
 
 class ACLGraphDumper:
@@ -453,6 +536,7 @@ class ACLGraphVllmInspector:
     def __init__(
         self,
         *,
+        dump_dir: str | None = None,
         include: tuple[str, ...] | list[str] = ("*",),
         max_steps: int = 8,
         strict_guard: bool = False,
@@ -460,6 +544,7 @@ class ACLGraphVllmInspector:
         atol: float = 1e-3,
         rtol: float = 1e-3,
     ):
+        self.dump_dir = dump_dir
         self.include = tuple(include)
         self.max_steps = int(max_steps)
         self.strict_guard = bool(strict_guard)
@@ -703,9 +788,4 @@ class ACLGraphVllmInspector:
         return False
 
 
-__all__ = [
-    "ACLGraphAddressTracker",
-    "ACLGraphCaptureGuard",
-    "ACLGraphDumper",
-    "ACLGraphVllmInspector",
-]
+__all__ = ["ACLGraphAddressTracker", "ACLGraphCaptureGuard", "ACLGraphDumper", "ACLGraphVllmInspector"]
