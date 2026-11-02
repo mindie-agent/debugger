@@ -315,3 +315,40 @@ def test_codex_distilled_custom_op_multithread_context_and_shm_triage():
     assert shm_res["fault_domain"] == "enginecore_shm_or_zmq_frame_corruption"
     assert shm_res["model_fault_category"] == "enginecore_shm_or_zmq_frame_corruption"
     assert any("shm_broadcast" in step for step in shm_res["remediation_steps"])
+
+
+def test_cli_triage_remote_plog_guide_and_auto_container_discovery(tmp_path, monkeypatch, capsys):
+    import json
+    import os
+    from mindie_debugger.cli import main
+
+    monkeypatch.setenv("MINDIE_DATA_HOME", str(tmp_path / "data"))
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.delenv("ASCEND_PROCESS_LOG_PATH", raising=False)
+
+    # 1. Local host with nonexistent remote container path -> returns remote_npu_execution_required
+    rc = main(["triage", "--root", str(tmp_path / "nonexistent_container_plog")])
+    assert rc == 0
+    out_missing = json.loads(capsys.readouterr().out)
+    assert out_missing["status"] == "remote_npu_execution_required"
+    assert "remote_npu_execution_guide" in out_missing
+    assert "triage_cann_plog_auto" in out_missing["remote_npu_execution_guide"]["step_2_execute_cli_in_npu_container"]["cli_examples"]
+
+    # 2. Inside remote container: ASCEND_PROCESS_LOG_PATH auto-discovery + --pid filter
+    plog_dir = tmp_path / "container_ascend_log" / "debug" / "plog"
+    plog_dir.mkdir(parents=True)
+    plog_file = plog_dir / "plog-4242_20261102150000000.log"
+    plog_file.write_text(
+        "[ERROR] RUNTIME(4242,4243):2026-11-02-15:00:01.000.000 "
+        "[aic_error] device_id=3, stream_id=12, task_id=88, error_code=507015, "
+        "failed_operator=FlashAttentionScore, MTE2_ERR=0x20\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("ASCEND_PROCESS_LOG_PATH", str(tmp_path / "container_ascend_log"))
+    rc2 = main(["triage", "--pid", "4242"])
+    assert rc2 == 0
+    out_container = json.loads(capsys.readouterr().out)
+    assert "507015" in out_container["error_codes"]
+    assert out_container["failed_operator"] == "FlashAttentionScore"
+    assert out_container["scanned_file_count"] == 1
+    assert str(plog_file) in out_container["scanned_files"][0]

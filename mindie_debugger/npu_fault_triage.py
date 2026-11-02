@@ -77,7 +77,7 @@ SYNC_HAZARD_RE = re.compile(
     re.IGNORECASE,
 )
 OP_RE = re.compile(
-    r"(?:failed\s+operator|failed\s+op|operator\s+name|operatorName|op_name|opName|"
+    r"(?:failed[_\s]+operator|failed[_\s]+op|operator[_\s]+name|operatorName|op_name|opName|"
     r"op_type|opType|kernel_name|kernelName|kernel\s+name|nodeInfo|node_info)"
     r"\s*(?:[:=]\s*|\s+)['\"]?([A-Za-z_][\w.:/-]*)"
 )

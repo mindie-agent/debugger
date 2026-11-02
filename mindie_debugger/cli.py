@@ -64,13 +64,13 @@ def _build_remote_execution_guide(
     stage_dir: str | Path | None = None,
 ) -> dict[str, Any]:
     bundle_path = _stage_remote_bundle(stage_dir)
-    quoted_args = " ".join(shlex.quote(a) for a in (argv or ["aclgraph", "inspect", "--script", "<repro.py>"]))
+    quoted_args = " ".join(shlex.quote(a) for a in (argv or ["triage"]))
     return {
         "summary": (
-            "Dynamic ACLGraph and NPU precision tools require the target Ascend NPU container runtime "
-            "(torch_npu / CANN / vllm-ascend). Push the staged pure-Python `mindie_debugger` bundle to the "
-            "remote NPU container with `mcp__remote-dev__remote_artifact_push` and execute it with "
-            "`mcp__remote-dev__remote_bash`."
+            "CANN plogs ($ASCEND_PROCESS_LOG_PATH or ~/ascend/log/debug/plog), dynamic ACLGraph tools, and "
+            "NPU precision tools reside/execute inside the target Ascend NPU container. Push the staged "
+            "pure-Python `mindie_debugger` bundle to the remote NPU container with "
+            "`mcp__remote-dev__remote_artifact_push` and execute it in-place with `mcp__remote-dev__remote_bash`."
         ),
         "local_bundle_path": str(bundle_path),
         "remote_stage_path": ".mindie_debugger/mindie_debugger",
@@ -85,8 +85,18 @@ def _build_remote_execution_guide(
             "mcp_tool": "mcp__remote-dev__remote_bash",
             "command": f"PYTHONPATH=.mindie_debugger:$PYTHONPATH python3 -m mindie_debugger.cli {quoted_args}",
             "cli_examples": {
-                "triage_logs": "PYTHONPATH=.mindie_debugger:$PYTHONPATH python3 -m mindie_debugger.cli triage --root <log_dir>",
-                "aclgraph_guard": "PYTHONPATH=.mindie_debugger:$PYTHONPATH python3 -m mindie_debugger.cli aclgraph guard --script <repro_or_test.py>",
+                "triage_cann_plog_auto": (
+                    "PYTHONPATH=.mindie_debugger:$PYTHONPATH python3 -m mindie_debugger.cli triage"
+                ),
+                "triage_cann_plog_by_pid": (
+                    "PYTHONPATH=.mindie_debugger:$PYTHONPATH python3 -m mindie_debugger.cli triage --pid <crashed_pid>"
+                ),
+                "triage_custom_log_dir": (
+                    "PYTHONPATH=.mindie_debugger:$PYTHONPATH python3 -m mindie_debugger.cli triage --root <log_dir_or_file>"
+                ),
+                "aclgraph_guard": (
+                    "PYTHONPATH=.mindie_debugger:$PYTHONPATH python3 -m mindie_debugger.cli aclgraph guard --script <repro_or_test.py>"
+                ),
                 "aclgraph_inspect": (
                     "PYTHONPATH=.mindie_debugger:$PYTHONPATH python3 -m mindie_debugger.cli aclgraph inspect "
                     "--script <repro_or_test.py> --compare-eager --dump-dir /tmp/aclgraph_dump"
@@ -214,10 +224,17 @@ def parser() -> argparse.ArgumentParser:
         prog="mindie-debugger",
         description="Ascend NPU CANN fault triage, 3-primitive precision/memory-stomp, and ACLGraph debugger")
     sub = result.add_subparsers(dest="command", required=True)
-    triage = sub.add_parser("triage", help="triage Ascend NPU plog / stderr fault text or multi-rank log directory")
-    triage.add_argument("--file", "-f", help="path to log file (reads stdin if omitted)")
-    triage.add_argument("--root", "-r", help="path to log directory containing multi-rank *.log / plog* files")
-    triage.add_argument("--text", help="inline log text to triage")
+    triage = sub.add_parser(
+        "triage",
+        help="triage Ascend CANN plog / stderr fault text or multi-rank log directory (auto-discovers $ASCEND_PROCESS_LOG_PATH or ~/ascend/log in NPU container)",
+    )
+    triage.add_argument("target", nargs="?", help="optional path to log file or CANN plog directory")
+    triage.add_argument("--file", "-f", help="path to log file")
+    triage.add_argument("--root", "-r", help="path to log directory containing *.log / plog* files (defaults to $ASCEND_PROCESS_LOG_PATH or ~/ascend/log)")
+    triage.add_argument("--text", help="inline log / traceback text to triage")
+    triage.add_argument("--pid", type=int, help="optional process ID filter for plog-<pid>_*.log files")
+    triage.add_argument("--latest", type=int, default=32, help="max number of recent log files to scan in --root (default: 32)")
+    triage.add_argument("--window-sec", type=float, default=600.0, help="time window in seconds around the newest fault log in --root (default: 600s)")
     decode = sub.add_parser("decode-code", help="decode a CANN / RTS / HCCL error code")
     decode.add_argument("code", help="error code (e.g. 507015, EZ9999, EI0006, 207008)")
     guide = sub.add_parser(
@@ -420,22 +437,87 @@ def _run_precision(args, raw_argv: list[str] | None = None):
     return {"status": "error", "reason": "unknown_precision_action"}, 2
 
 
-def _triage_directory(root_dir: Path) -> str:
-    rank_pat = re.compile(r"rank[_-]?(\d+)", re.IGNORECASE)
-    chunks: list[str] = []
-    for path in sorted(root_dir.rglob("*")):
+_FAULT_HINT_RE = re.compile(
+    r"\[ERROR\]|\bERROR\b|E[A-Z0-9][0-9][0-9A-Z]{3}|\b(?:107|161|207|507|561)\d{3}\b|"
+    r"aicore\s+error|aic\s+error|HCCL_E_|RuntimeError|Traceback",
+    re.IGNORECASE,
+)
+
+
+def _read_bounded_log_text(path: Path, max_bytes: int = 4 * 1024 * 1024) -> str:
+    try:
+        size = path.stat().st_size
+    except OSError:
+        return ""
+    if size <= max_bytes:
+        return path.read_text(encoding="utf-8", errors="replace")
+    head_bytes = 256 * 1024
+    tail_bytes = max_bytes - head_bytes
+    with path.open("rb") as fh:
+        head = fh.read(head_bytes).decode("utf-8", errors="replace")
+        fh.seek(max(head_bytes, size - tail_bytes))
+        tail = fh.read(tail_bytes).decode("utf-8", errors="replace")
+    return head + "\n...[truncated middle of large plog]...\n" + tail
+
+
+def _default_cann_log_root() -> Path | None:
+    env_path = os.environ.get("ASCEND_PROCESS_LOG_PATH", "").strip()
+    if env_path:
+        candidate = Path(env_path).expanduser()
+        if candidate.exists():
+            return candidate
+    home_cann = Path.home() / "ascend" / "log"
+    if home_cann.exists():
+        return home_cann
+    return None
+
+
+def _triage_directory(
+    root_dir: Path,
+    *,
+    pid: int | None = None,
+    latest: int = 32,
+    window_sec: float = 600.0,
+) -> tuple[str, list[str]]:
+    rank_pat = re.compile(r"(?:rank|device)[_-]?(\d+)", re.IGNORECASE)
+    pid_token = str(pid) if pid is not None else None
+    candidates: list[tuple[float, Path]] = []
+    for path in root_dir.rglob("*"):
         if not path.is_file():
             continue
-        if path.suffix.lower() not in (".log", ".txt", ".out", ".err") and not path.name.startswith("plog"):
+        if path.suffix.lower() not in (".log", ".txt", ".out", ".err") and not path.name.startswith(("plog", "device-")):
             continue
+        if pid_token is not None and f"plog-{pid_token}_" not in path.name and pid_token not in path.name:
+            continue
+        try:
+            mtime = path.stat().st_mtime
+        except OSError:
+            mtime = 0.0
+        candidates.append((mtime, path))
+    if not candidates:
+        return "", []
+    candidates.sort(key=lambda item: (item[0], str(item[1])), reverse=True)
+    anchor_mtime = candidates[0][0]
+    for mtime, path in candidates[: max(latest * 2, 64)]:
+        if _FAULT_HINT_RE.search(_read_bounded_log_text(path, max_bytes=512 * 1024)):
+            anchor_mtime = mtime
+            break
+    if window_sec > 0 and len(candidates) > latest:
+        windowed = [item for item in candidates if item[0] >= anchor_mtime - window_sec]
+        selected = (windowed or candidates)[: max(1, latest)]
+    else:
+        selected = candidates[: max(1, latest)]
+    selected_paths = [item[1] for item in sorted(selected, key=lambda item: str(item[1]))]
+    chunks: list[str] = []
+    for path in selected_paths:
         m = rank_pat.search(path.name) or rank_pat.search(str(path.parent))
         inferred_rank = m.group(1) if m else None
-        for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        for line in _read_bounded_log_text(path).splitlines():
             if inferred_rank is not None and "rank_id" not in line and "rank " not in line.lower():
                 chunks.append(f"[rank_id: {inferred_rank}] {line}")
             else:
                 chunks.append(line)
-    return "\n".join(chunks)
+    return "\n".join(chunks), [str(p) for p in selected_paths]
 
 
 def _run_aclgraph(args, raw_argv: list[str] | None = None):
@@ -534,16 +616,62 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.command == "triage":
         from .npu_fault_triage import triage_npu_fault
+        scanned_files: list[str] = []
+        explicit_path = getattr(args, "root", None) or getattr(args, "file", None) or getattr(args, "target", None)
         if args.text is not None:
             text = args.text
-        elif getattr(args, "root", None):
-            text = _triage_directory(Path(args.root))
-        elif args.file:
-            text = Path(args.file).read_text(encoding="utf-8", errors="replace")
+        elif explicit_path:
+            target_path = Path(explicit_path).expanduser()
+            if not target_path.exists():
+                print(json.dumps({
+                    "status": "remote_npu_execution_required",
+                    "reason": (
+                        f"Log path '{target_path}' does not exist on the local host; CANN plogs "
+                        "($ASCEND_PROCESS_LOG_PATH or ~/ascend/log/debug/plog) reside inside the remote NPU container."
+                    ),
+                    "remote_npu_execution_guide": _build_remote_execution_guide(raw_argv),
+                }, ensure_ascii=True))
+                return 0
+            if target_path.is_dir():
+                text, scanned_files = _triage_directory(
+                    target_path, pid=args.pid, latest=args.latest, window_sec=args.window_sec
+                )
+            else:
+                text, scanned_files = _read_bounded_log_text(target_path), [str(target_path)]
         else:
-            text = sys.stdin.read()
+            stdin_text = ""
+            if not sys.stdin.isatty() and args.pid is None:
+                try:
+                    stdin_text = sys.stdin.read()
+                except TimeoutError:
+                    raise
+                except OSError:
+                    stdin_text = ""
+            if stdin_text.strip():
+                text, scanned_files = stdin_text, ["<stdin>"]
+            else:
+                default_root = _default_cann_log_root()
+                if default_root is not None:
+                    text, scanned_files = _triage_directory(
+                        default_root, pid=args.pid, latest=args.latest, window_sec=args.window_sec
+                    )
+                else:
+                    print(json.dumps({
+                        "status": "remote_npu_execution_required",
+                        "reason": (
+                            "No inline --text provided and default CANN plog directory "
+                            "($ASCEND_PROCESS_LOG_PATH or ~/ascend/log) was not found on the local host. "
+                            "Push mindie_debugger to the remote NPU container and run `triage` there, "
+                            "or pass `--text '<error snippet>'`."
+                        ),
+                        "remote_npu_execution_guide": _build_remote_execution_guide(["triage"]),
+                    }, ensure_ascii=True))
+                    return 0
         payload = triage_npu_fault(text)
-        payload["remote_npu_execution_guide"] = _build_remote_execution_guide()
+        if scanned_files:
+            payload["scanned_file_count"] = len(scanned_files)
+            payload["scanned_files"] = scanned_files[:16]
+        payload["remote_npu_execution_guide"] = _build_remote_execution_guide(raw_argv)
         print(json.dumps(payload, ensure_ascii=True))
         return 0
     if args.command == "aclgraph":
