@@ -744,7 +744,11 @@ def main(argv: list[str] | None = None) -> int:
         if scanned_files:
             payload["scanned_file_count"] = len(scanned_files)
             payload["scanned_files"] = scanned_files[:16]
-        live_env = _inspect_live_process_env(args.pid or payload.get("root_cause_pid"))
+        live_env = (
+            _inspect_live_process_env(args.pid)
+            if (args.pid is not None and not args.text and not args.file)
+            else None
+        )
         if live_env is not None:
             payload["live_process_env_audit"] = live_env
         payload["remote_npu_execution_guide"] = _build_remote_execution_guide(raw_argv)

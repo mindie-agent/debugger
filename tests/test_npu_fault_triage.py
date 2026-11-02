@@ -399,3 +399,10 @@ def test_live_process_env_audit_and_runtime_guard_funnel(tmp_path, monkeypatch):
     assert "runtime_guard" in steps_joined
     assert "n_prompt + n_output - 1" in steps_joined
     assert "summary_mode" in steps_joined
+
+    # Offline --text triage must NOT attach a local /proc/<pid> audit when --pid was not requested
+    import json
+    from mindie_debugger.cli import main
+
+    rc_text = main(["triage", "--text", "[ERROR] RUNTIME(4242,4243):2020-01-01-00:00:00.000.000 ErrCode=507015"])
+    assert rc_text == 0

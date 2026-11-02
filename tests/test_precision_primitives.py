@@ -782,3 +782,14 @@ def test_tensor_metrics_numeric_issue_priority_and_unused_slot_hygiene():
     assert m_nan["numeric_issue"] == "target_nan"
     assert m_nan["cosine_sim"] is None
 
+    # Extreme finite float64 magnitudes must not overflow/underflow cosine_sim or false-trigger target_zero_norm
+    huge = torch.tensor([1e200, 1e200], dtype=torch.float64)
+    m_huge = _tensor_metrics("kv", huge, huge.clone(), [], None)
+    assert m_huge["numeric_issue"] is None
+    assert m_huge["cosine_sim"] == pytest.approx(1.0)
+
+    tiny = torch.tensor([1e-200, 1e-200], dtype=torch.float64)
+    m_tiny = _tensor_metrics("kv", tiny, -tiny, [], None)
+    assert m_tiny["numeric_issue"] is None
+    assert m_tiny["cosine_sim"] == pytest.approx(-1.0)
+

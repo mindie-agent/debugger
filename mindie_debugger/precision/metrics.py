@@ -187,6 +187,8 @@ def _tensor_metrics(path, baseline, target, jitter_tensors, jitter_floor_overrid
         norm_targ = float(torch.linalg.vector_norm(b).item()) if b.numel() else 0.0
         norm_diff = float(torch.linalg.vector_norm(diff).item()) if diff.numel() else 0.0
         nonfinite = int(mismatch.sum().item())
+        base_nonzero = bool((a != 0).any().item())
+        targ_nonzero = bool((b != 0).any().item())
         numeric_issue = None
         if not int_input:
             if bool(nan_b.any().item()):
@@ -195,17 +197,22 @@ def _tensor_metrics(path, baseline, target, jitter_tensors, jitter_floor_overrid
                 numeric_issue = "target_inf"
             elif bool((nan_a | inf_a).any().item()):
                 numeric_issue = "baseline_nonfinite"
-            elif norm_base > 0.0 and norm_targ == 0.0:
+            elif base_nonzero and not targ_nonzero:
                 numeric_issue = "target_zero_norm"
         cosine_sim = None
         if not int_input and not complex_input and numeric_issue is None:
-            if a.numel() == 0 or (norm_base == 0.0 and norm_targ == 0.0):
+            if a.numel() == 0 or (not base_nonzero and not targ_nonzero):
                 cosine_sim = 1.0
-            elif norm_base > 0.0 and norm_targ > 0.0:
-                raw_cos = float(
-                    torch.dot(a.reshape(-1) / norm_base, b.reshape(-1) / norm_targ).item()
-                )
-                cosine_sim = max(-1.0, min(1.0, raw_cos))
+            elif base_nonzero and targ_nonzero:
+                sa = float(a.abs().max().item())
+                sb = float(b.abs().max().item())
+                ua = a.reshape(-1) / sa
+                ub = b.reshape(-1) / sb
+                na = float(torch.linalg.vector_norm(ua).item())
+                nb = float(torch.linalg.vector_norm(ub).item())
+                if na > 0.0 and nb > 0.0:
+                    raw_cos = float(torch.dot(ua / na, ub / nb).item())
+                    cosine_sim = max(-1.0, min(1.0, raw_cos))
         if nonfinite == 0 and norm_diff == 0.0:
             rel_l2 = 0.0
         elif not math.isfinite(norm_diff):

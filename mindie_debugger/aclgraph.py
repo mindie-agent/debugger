@@ -155,6 +155,9 @@ class ACLGraphAddressTracker:
         block_size: int | None = None,
         num_blocks: int | None = None,
         null_block_id: int | None = None,
+        sliding_window: int | None = None,
+        local_slot_mask: Any = None,
+        allow_unmapped_active_slots: bool = False,
         **roots: Any,
     ) -> dict[str, Any]:
         torch = _require_torch()
@@ -168,6 +171,8 @@ class ACLGraphAddressTracker:
                 block_table_tensor = meta_root.get("block_tables")
         if seq_lens_tensor is None:
             seq_lens_tensor = meta_root.get("seq_lens")
+        if local_slot_mask is None:
+            local_slot_mask = meta_root.get("local_slot_mask")
         for root_name, root_val in roots.items():
             for subpath, leaf in flatten_tree_with_paths(root_val):
                 if not isinstance(leaf, torch.Tensor):
@@ -208,7 +213,13 @@ class ACLGraphAddressTracker:
                 act_n = int(actual_tokens)
                 active = flat_slots[:act_n]
                 shortfall = max(0, act_n - int(flat_slots.numel()))
-                unmapped = int((active < 0).sum().item())
+                if allow_unmapped_active_slots:
+                    unmapped = 0
+                elif local_slot_mask is not None and isinstance(local_slot_mask, torch.Tensor):
+                    mask_flat = local_slot_mask.detach().reshape(-1)[: int(active.numel())].bool()
+                    unmapped = int((active[mask_flat] < 0).sum().item())
+                else:
+                    unmapped = int((active < 0).sum().item())
                 oob = (
                     (int((active >= max_slot_limit).sum().item()) if max_slot_limit is not None else 0)
                     + shortfall
@@ -261,27 +272,39 @@ class ACLGraphAddressTracker:
             for req_idx, req_tokens in enumerate(req_lengths):
                 if req_tokens <= 0:
                     continue
-                row = bt_2d[req_idx].reshape(-1).tolist() if req_idx < int(bt_2d.shape[0]) else []
-                valid_blocks = [
-                    int(bid) for bid in row
-                    if int(bid) >= 0 and (null_block_id is None or int(bid) != int(null_block_id))
+                row = [int(v) for v in bt_2d[req_idx].reshape(-1).tolist()] if req_idx < int(bt_2d.shape[0]) else []
+                req_blocks = (req_tokens + bsize - 1) // bsize
+                start_blk = (
+                    max(0, (req_tokens - int(sliding_window)) // bsize)
+                    if (sliding_window is not None and int(sliding_window) > 0)
+                    else 0
+                )
+                needed_slice = row[start_blk:req_blocks]
+                valid_needed = [
+                    bid for bid in needed_slice
+                    if bid >= 0 and (null_block_id is None or bid != int(null_block_id))
                 ]
-                capacity = len(valid_blocks) * bsize
-                if capacity < req_tokens:
+                expected_blk_count = max(0, req_blocks - start_blk)
+                if len(valid_needed) < expected_blk_count:
+                    capacity = (start_blk + len(valid_needed)) * bsize
                     violations.append({
                         "kind": "block_table_capacity_insufficient",
                         "request_index": req_idx,
                         "required_tokens": req_tokens,
-                        "allocated_valid_blocks": len(valid_blocks),
+                        "allocated_valid_blocks": len(valid_needed),
                         "block_size": bsize,
                         "capacity_tokens": capacity,
                         "hint": (
-                            f"Request {req_idx} requires {req_tokens} KV tokens but block_table only provides "
-                            f"{len(valid_blocks)} * {bsize} = {capacity} capacity (len(block_ids) * block_size < n_tokens)."
+                            f"Request {req_idx} requires logical blocks [{start_blk}:{req_blocks}] for {req_tokens} tokens "
+                            f"but only {len(valid_needed)}/{expected_blk_count} required blocks are mapped."
                         ),
                     })
                 if num_blocks is not None:
-                    oob_blocks = [bid for bid in valid_blocks if bid >= int(num_blocks)]
+                    active_blocks = [
+                        bid for bid in row[:req_blocks]
+                        if bid >= 0 and (null_block_id is None or bid != int(null_block_id))
+                    ]
+                    oob_blocks = [bid for bid in active_blocks if bid >= int(num_blocks)]
                     if oob_blocks:
                         violations.append({
                             "kind": "block_table_out_of_bounds",
@@ -421,25 +444,18 @@ class ACLGraphDumper:
                 numel *= dim
             take = min(numel, self.max_snapshot_numel)
             raw = slot_buf[idx, :take].detach().to("cpu").clone()
-            if take == numel:
-                tensors[name] = raw.reshape(orig_shape)
-            else:
-                tensors[name] = raw
-            finite_mask = torch.isfinite(raw)
-            finite_vals = raw[finite_mask]
+            tensors[name] = raw.reshape(orig_shape) if take == numel else raw
+            finite_vals = raw[torch.isfinite(raw)]
+            has_fin = finite_vals.numel() > 0
             telemetry[name] = {
                 "slot": idx,
                 "valid_count": int(raw.numel()),
                 "nan_count": int(torch.isnan(raw).sum().item()),
                 "inf_count": int(torch.isinf(raw).sum().item()),
-                "min": float(finite_vals.min().item()) if finite_vals.numel() > 0 else 0.0,
-                "max": float(finite_vals.max().item()) if finite_vals.numel() > 0 else 0.0,
-                "l2_norm": float(torch.linalg.vector_norm(finite_vals).item())
-                if finite_vals.numel() > 0
-                else 0.0,
-                "abs_max": float(finite_vals.abs().max().item())
-                if finite_vals.numel() > 0
-                else 0.0,
+                "min": float(finite_vals.min().item()) if has_fin else 0.0,
+                "max": float(finite_vals.max().item()) if has_fin else 0.0,
+                "l2_norm": float(torch.linalg.vector_norm(finite_vals).item()) if has_fin else 0.0,
+                "abs_max": float(finite_vals.abs().max().item()) if has_fin else 0.0,
             }
         return {"step_index": idx, "tensors": tensors, "telemetry": telemetry}
 
@@ -568,14 +584,8 @@ class ACLGraphVllmInspector:
         extracted: dict[str, Any] = {}
         items = attn_meta.values() if isinstance(attn_meta, dict) else ([attn_meta] if attn_meta is not None else [])
         tensor_attrs = (
-            "slot_mapping",
-            "seq_lens",
-            "query_start_loc",
-            "block_table",
-            "block_tables",
-            "state_indices",
-            "conv_state_indices",
-            "ssm_state_indices",
+            "slot_mapping", "seq_lens", "query_start_loc", "block_table",
+            "block_tables", "state_indices", "conv_state_indices", "ssm_state_indices",
         )
         for sub_meta in items:
             if sub_meta is None:
