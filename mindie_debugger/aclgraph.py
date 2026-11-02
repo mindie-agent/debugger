@@ -39,14 +39,7 @@ from .precision.npu_watch import WatchRingBuffer
 from .precision.storage_graph import _require_torch, _storage_identity
 from .precision.tree_utils import flatten_tree_with_paths, path_to_string
 
-_SYNC_FUNC_NAMES = frozenset({
-    "item",
-    "tolist",
-    "__bool__",
-    "__index__",
-    "numpy",
-    "nonzero",
-})
+_SYNC_FUNC_NAMES = frozenset({"item", "tolist", "__bool__", "__index__", "numpy", "nonzero"})
 
 
 def _first_user_frame() -> str:
@@ -157,10 +150,29 @@ class ACLGraphAddressTracker:
         actual_tokens: int | None = None,
         padded_tokens: int | None = None,
         slot_mapping_tensor: Any = None,
+        block_table_tensor: Any = None,
+        seq_lens_tensor: Any = None,
+        block_size: int | None = None,
+        num_blocks: int | None = None,
+        null_block_id: int | None = None,
+        sliding_window: int | None = None,
+        local_slot_mask: Any = None,
+        allow_unmapped_active_slots: bool = False,
         **roots: Any,
     ) -> dict[str, Any]:
         torch = _require_torch()
         violations: list[dict[str, Any]] = []
+        meta_root = roots.get("meta") if isinstance(roots.get("meta"), dict) else {}
+        if slot_mapping_tensor is None:
+            slot_mapping_tensor = meta_root.get("slot_mapping")
+        if block_table_tensor is None:
+            block_table_tensor = meta_root.get("block_table")
+            if block_table_tensor is None:
+                block_table_tensor = meta_root.get("block_tables")
+        if seq_lens_tensor is None:
+            seq_lens_tensor = meta_root.get("seq_lens")
+        if local_slot_mask is None:
+            local_slot_mask = meta_root.get("local_slot_mask")
         for root_name, root_val in roots.items():
             for subpath, leaf in flatten_tree_with_paths(root_val):
                 if not isinstance(leaf, torch.Tensor):
@@ -190,26 +202,117 @@ class ACLGraphAddressTracker:
                         "captured_shape": list(expected["shape"]),
                         "replay_shape": list(observed_shape),
                     })
+        if slot_mapping_tensor is not None and isinstance(slot_mapping_tensor, torch.Tensor):
+            flat_slots = slot_mapping_tensor.detach().reshape(-1)
+            max_slot_limit = (
+                int(num_blocks) * int(block_size)
+                if (num_blocks is not None and block_size is not None and int(block_size) > 0)
+                else None
+            )
+            if actual_tokens is not None and int(actual_tokens) > 0:
+                act_n = int(actual_tokens)
+                active = flat_slots[:act_n]
+                shortfall = max(0, act_n - int(flat_slots.numel()))
+                if allow_unmapped_active_slots:
+                    unmapped = 0
+                elif local_slot_mask is not None and isinstance(local_slot_mask, torch.Tensor):
+                    mask_flat = local_slot_mask.detach().reshape(-1)[: int(active.numel())].bool()
+                    unmapped = int((active[mask_flat] < 0).sum().item())
+                else:
+                    unmapped = int((active < 0).sum().item())
+                oob = (
+                    (int((active >= max_slot_limit).sum().item()) if max_slot_limit is not None else 0)
+                    + shortfall
+                )
+                if unmapped > 0 or oob > 0:
+                    violations.append({
+                        "kind": "active_slot_out_of_bounds",
+                        "actual_tokens": act_n,
+                        "unmapped_active_slot_count": unmapped,
+                        "oob_active_slot_count": oob,
+                        "max_slot_limit": max_slot_limit,
+                        "hint": (
+                            "Active slot_mapping[:actual_tokens] contains negative (-1) or out-of-range "
+                            "physical KV slots, dropping written tokens or corrupting adjacent KV memory."
+                        ),
+                    })
+            if (
+                actual_tokens is not None
+                and padded_tokens is not None
+                and int(padded_tokens) > int(actual_tokens)
+            ):
+                tail = flat_slots[int(actual_tokens):int(padded_tokens)]
+                bad_slots = int((tail >= 0).sum().item())
+                if bad_slots > 0:
+                    violations.append({
+                        "kind": "unmasked_padded_slot_mapping",
+                        "actual_tokens": int(actual_tokens),
+                        "padded_tokens": int(padded_tokens),
+                        "unmasked_slot_count": bad_slots,
+                        "hint": (
+                            "Padded tail slot_mapping[actual_tokens:padded_tokens] contains non-negative "
+                            "slot IDs; fill padded slots with -1 so ACLGraph replay does not overwrite live KV/state."
+                        ),
+                    })
         if (
-            slot_mapping_tensor is not None
-            and isinstance(slot_mapping_tensor, torch.Tensor)
-            and actual_tokens is not None
-            and padded_tokens is not None
-            and int(padded_tokens) > int(actual_tokens)
+            block_table_tensor is not None
+            and isinstance(block_table_tensor, torch.Tensor)
+            and block_size is not None
+            and int(block_size) > 0
         ):
-            tail = slot_mapping_tensor.detach().reshape(-1)[int(actual_tokens):int(padded_tokens)]
-            bad_slots = int((tail >= 0).sum().item())
-            if bad_slots > 0:
-                violations.append({
-                    "kind": "unmasked_padded_slot_mapping",
-                    "actual_tokens": int(actual_tokens),
-                    "padded_tokens": int(padded_tokens),
-                    "unmasked_slot_count": bad_slots,
-                    "hint": (
-                        "Padded tail slot_mapping[actual_tokens:padded_tokens] contains non-negative "
-                        "slot IDs; fill padded slots with -1 so ACLGraph replay does not overwrite live KV/state."
-                    ),
-                })
+            bsize = int(block_size)
+            bt_2d = block_table_tensor.detach()
+            if bt_2d.dim() == 1:
+                bt_2d = bt_2d.unsqueeze(0)
+            req_lengths: list[int] = []
+            if seq_lens_tensor is not None and isinstance(seq_lens_tensor, torch.Tensor):
+                req_lengths = [int(v) for v in seq_lens_tensor.detach().reshape(-1).tolist()]
+            elif actual_tokens is not None and bt_2d.shape[0] == 1:
+                req_lengths = [int(actual_tokens)]
+            for req_idx, req_tokens in enumerate(req_lengths):
+                if req_tokens <= 0:
+                    continue
+                row = [int(v) for v in bt_2d[req_idx].reshape(-1).tolist()] if req_idx < int(bt_2d.shape[0]) else []
+                req_blocks = (req_tokens + bsize - 1) // bsize
+                start_blk = (
+                    max(0, (req_tokens - int(sliding_window)) // bsize)
+                    if (sliding_window is not None and int(sliding_window) > 0)
+                    else 0
+                )
+                needed_slice = row[start_blk:req_blocks]
+                valid_needed = [
+                    bid for bid in needed_slice
+                    if bid >= 0 and (null_block_id is None or bid != int(null_block_id))
+                ]
+                expected_blk_count = max(0, req_blocks - start_blk)
+                if len(valid_needed) < expected_blk_count:
+                    capacity = (start_blk + len(valid_needed)) * bsize
+                    violations.append({
+                        "kind": "block_table_capacity_insufficient",
+                        "request_index": req_idx,
+                        "required_tokens": req_tokens,
+                        "allocated_valid_blocks": len(valid_needed),
+                        "block_size": bsize,
+                        "capacity_tokens": capacity,
+                        "hint": (
+                            f"Request {req_idx} requires logical blocks [{start_blk}:{req_blocks}] for {req_tokens} tokens "
+                            f"but only {len(valid_needed)}/{expected_blk_count} required blocks are mapped."
+                        ),
+                    })
+                if num_blocks is not None:
+                    active_blocks = [
+                        bid for bid in row[:req_blocks]
+                        if bid >= 0 and (null_block_id is None or bid != int(null_block_id))
+                    ]
+                    oob_blocks = [bid for bid in active_blocks if bid >= int(num_blocks)]
+                    if oob_blocks:
+                        violations.append({
+                            "kind": "block_table_out_of_bounds",
+                            "request_index": req_idx,
+                            "num_blocks": int(num_blocks),
+                            "oob_block_ids": oob_blocks[:8],
+                            "hint": f"block_table row {req_idx} references block_id >= num_blocks ({int(num_blocks)}).",
+                        })
         return {
             "status": "ok" if not violations else "violation",
             "bound_tensor_count": len(self._bound),
@@ -217,6 +320,9 @@ class ACLGraphAddressTracker:
             "first_violation": violations[0] if violations else None,
             "violations": violations,
         }
+
+    record_capture = bind_capture_inputs
+    verify_replay = verify_replay_inputs
 
 
 class ACLGraphDumper:
@@ -274,16 +380,8 @@ class ACLGraphDumper:
 
     def _slots_init_for(self, name: str) -> None:
         torch = _require_torch()
-        self._slots[name] = torch.zeros(
-            (self.max_steps, self.max_snapshot_numel),
-            dtype=torch.float32,
-            device=self.device,
-        )
-        self._scratch[name] = torch.zeros(
-            (self.max_snapshot_numel,),
-            dtype=torch.float32,
-            device=self.device,
-        )
+        self._slots[name] = torch.zeros((self.max_steps, self.max_snapshot_numel), dtype=torch.float32, device=self.device)
+        self._scratch[name] = torch.zeros((self.max_snapshot_numel,), dtype=torch.float32, device=self.device)
 
     def _make_hook(self, name: str) -> Callable:
         torch = _require_torch()
@@ -338,25 +436,18 @@ class ACLGraphDumper:
                 numel *= dim
             take = min(numel, self.max_snapshot_numel)
             raw = slot_buf[idx, :take].detach().to("cpu").clone()
-            if take == numel:
-                tensors[name] = raw.reshape(orig_shape)
-            else:
-                tensors[name] = raw
-            finite_mask = torch.isfinite(raw)
-            finite_vals = raw[finite_mask]
+            tensors[name] = raw.reshape(orig_shape) if take == numel else raw
+            finite_vals = raw[torch.isfinite(raw)]
+            has_fin = finite_vals.numel() > 0
             telemetry[name] = {
                 "slot": idx,
                 "valid_count": int(raw.numel()),
                 "nan_count": int(torch.isnan(raw).sum().item()),
                 "inf_count": int(torch.isinf(raw).sum().item()),
-                "min": float(finite_vals.min().item()) if finite_vals.numel() > 0 else 0.0,
-                "max": float(finite_vals.max().item()) if finite_vals.numel() > 0 else 0.0,
-                "l2_norm": float(torch.linalg.vector_norm(finite_vals).item())
-                if finite_vals.numel() > 0
-                else 0.0,
-                "abs_max": float(finite_vals.abs().max().item())
-                if finite_vals.numel() > 0
-                else 0.0,
+                "min": float(finite_vals.min().item()) if has_fin else 0.0,
+                "max": float(finite_vals.max().item()) if has_fin else 0.0,
+                "l2_norm": float(torch.linalg.vector_norm(finite_vals).item()) if has_fin else 0.0,
+                "abs_max": float(finite_vals.abs().max().item()) if has_fin else 0.0,
             }
         return {"step_index": idx, "tensors": tensors, "telemetry": telemetry}
 
@@ -453,6 +544,7 @@ class ACLGraphVllmInspector:
     def __init__(
         self,
         *,
+        dump_dir: str | None = None,
         include: tuple[str, ...] | list[str] = ("*",),
         max_steps: int = 8,
         strict_guard: bool = False,
@@ -460,6 +552,7 @@ class ACLGraphVllmInspector:
         atol: float = 1e-3,
         rtol: float = 1e-3,
     ):
+        self.dump_dir = dump_dir
         self.include = tuple(include)
         self.max_steps = int(max_steps)
         self.strict_guard = bool(strict_guard)
@@ -483,14 +576,8 @@ class ACLGraphVllmInspector:
         extracted: dict[str, Any] = {}
         items = attn_meta.values() if isinstance(attn_meta, dict) else ([attn_meta] if attn_meta is not None else [])
         tensor_attrs = (
-            "slot_mapping",
-            "seq_lens",
-            "query_start_loc",
-            "block_table",
-            "block_tables",
-            "state_indices",
-            "conv_state_indices",
-            "ssm_state_indices",
+            "slot_mapping", "seq_lens", "query_start_loc", "block_table",
+            "block_tables", "state_indices", "conv_state_indices", "ssm_state_indices",
         )
         for sub_meta in items:
             if sub_meta is None:
@@ -703,9 +790,4 @@ class ACLGraphVllmInspector:
         return False
 
 
-__all__ = [
-    "ACLGraphAddressTracker",
-    "ACLGraphCaptureGuard",
-    "ACLGraphDumper",
-    "ACLGraphVllmInspector",
-]
+__all__ = ["ACLGraphAddressTracker", "ACLGraphCaptureGuard", "ACLGraphDumper", "ACLGraphVllmInspector"]

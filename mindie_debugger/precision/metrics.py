@@ -28,7 +28,9 @@ def _missing_metric(path, status, tensor):
             "rel_l2_err": _INF, "ulp_max": 0,
             "nonfinite_mismatch_count": int(tensor.numel()),
             "sample_count": int(tensor.numel()), "jitter_p50": 0.0,
-            "jitter_max": 0.0, "sjr": _INF, "ulp_floor": 0.0}
+            "jitter_max": 0.0, "sjr": _INF, "ulp_floor": 0.0,
+            "numeric_issue": status, "cosine_sim": None,
+            "unused_slot_status": None}
 def _ordered_bits(tensor):
     torch = _require_torch()
     if tensor.dtype == torch.float64:
@@ -109,7 +111,7 @@ def _jitter_delta(baseline, candidate):
         delta = torch.where(same_nan | same_inf, torch.zeros_like(delta), delta)
     return torch.where(torch.isnan(delta), torch.full_like(delta, _INF), delta).reshape(-1)
 def _tensor_metrics(path, baseline, target, jitter_tensors, jitter_floor_override,
-                    jitter_summary=None):
+                    jitter_summary=None, valid_length=None):
     torch = _require_torch()
     if tuple(baseline.shape) != tuple(target.shape):
         return _missing_metric(path, "shape_mismatch", baseline)
@@ -118,11 +120,33 @@ def _tensor_metrics(path, baseline, target, jitter_tensors, jitter_floor_overrid
     with torch.no_grad():
         complex_input = baseline.is_complex()
         int_input = not baseline.dtype.is_floating_point and not complex_input
+        unused_slot_status = None
+        if valid_length is not None and baseline.dim() >= 1:
+            vlen = max(0, min(int(valid_length), int(baseline.shape[0])))
+            if vlen < int(baseline.shape[0]):
+                unused = target[vlen:]
+                if not int_input and bool((torch.isnan(unused) | torch.isinf(unused)).any().item()):
+                    unused_slot_status = "nonfinite_pollution"
+                elif bool((unused != 0).any().item()):
+                    unused_slot_status = "finite_dirty"
+                else:
+                    unused_slot_status = "clean_zero"
+                baseline = baseline[:vlen]
+                target = target[:vlen]
+                jitter_tensors = [
+                    jt[:vlen] if getattr(jt, "dim", lambda: 0)() >= 1 and jt.shape[0] > vlen else jt
+                    for jt in jitter_tensors
+                ]
+                if jitter_tensors:
+                    jitter_summary = None
+            else:
+                unused_slot_status = "clean_zero"
         int_diff = None
         if int_input:
             a_int = baseline.to(torch.int64)
             b_int = target.to(torch.int64)
             a = a_int.to(torch.float64)
+            b = b_int.to(torch.float64)
             int_diff = [abs(left - right)
                         for left, right in zip(_python_ints(a_int), _python_ints(b_int))]
             diff = torch.tensor(int_diff, dtype=torch.float64, device=a.device)
@@ -160,8 +184,35 @@ def _tensor_metrics(path, baseline, target, jitter_tensors, jitter_floor_overrid
         else:
             max_abs = float(diff.max().item()) if diff.numel() else 0.0
         norm_base = float(torch.linalg.vector_norm(a).item()) if a.numel() else 0.0
+        norm_targ = float(torch.linalg.vector_norm(b).item()) if b.numel() else 0.0
         norm_diff = float(torch.linalg.vector_norm(diff).item()) if diff.numel() else 0.0
         nonfinite = int(mismatch.sum().item())
+        base_nonzero = bool((a != 0).any().item())
+        targ_nonzero = bool((b != 0).any().item())
+        numeric_issue = None
+        if not int_input:
+            if bool(nan_b.any().item()):
+                numeric_issue = "target_nan"
+            elif bool(inf_b.any().item()):
+                numeric_issue = "target_inf"
+            elif bool((nan_a | inf_a).any().item()):
+                numeric_issue = "baseline_nonfinite"
+            elif base_nonzero and not targ_nonzero:
+                numeric_issue = "target_zero_norm"
+        cosine_sim = None
+        if not int_input and not complex_input and numeric_issue is None:
+            if a.numel() == 0 or (not base_nonzero and not targ_nonzero):
+                cosine_sim = 1.0
+            elif base_nonzero and targ_nonzero:
+                sa = float(a.abs().max().item())
+                sb = float(b.abs().max().item())
+                ua = a.reshape(-1) / sa
+                ub = b.reshape(-1) / sb
+                na = float(torch.linalg.vector_norm(ua).item())
+                nb = float(torch.linalg.vector_norm(ub).item())
+                if na > 0.0 and nb > 0.0:
+                    raw_cos = float(torch.dot(ua / na, ub / nb).item())
+                    cosine_sim = max(-1.0, min(1.0, raw_cos))
         if nonfinite == 0 and norm_diff == 0.0:
             rel_l2 = 0.0
         elif not math.isfinite(norm_diff):
@@ -193,7 +244,9 @@ def _tensor_metrics(path, baseline, target, jitter_tensors, jitter_floor_overrid
         return {"tree_path": path, "status": "ok", "max_abs_err": max_abs, "rel_l2_err": rel_l2,
                 "ulp_max": ulp, "nonfinite_mismatch_count": nonfinite,
                 "sample_count": int(baseline.numel()), "jitter_p50": jitter_p50,
-                "jitter_max": jitter_max, "sjr": sjr, "ulp_floor": floor}
+                "jitter_max": jitter_max, "sjr": sjr, "ulp_floor": floor,
+                "numeric_issue": numeric_issue, "cosine_sim": cosine_sim,
+                "unused_slot_status": unused_slot_status}
 def _aggregate_metrics(metrics):
     return {"max_abs_err": max((m["max_abs_err"] for m in metrics), default=0.0),
             "rel_l2_err": max((m["rel_l2_err"] for m in metrics), default=0.0),

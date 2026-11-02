@@ -749,3 +749,47 @@ def test_codex_guardrail_regressions():
     assert rep_mixed["reference_check"]["reason"] == "mixed_dtype_storage_alias"
     assert rep_mixed["verdict"] == "unsupported"
 
+
+def test_tensor_metrics_numeric_issue_priority_and_unused_slot_hygiene():
+    torch = pytest.importorskip("torch")
+    from mindie_debugger.precision.metrics import _tensor_metrics
+
+    base = torch.tensor([[1.0, 2.0], [3.0, 4.0], [0.0, 0.0], [0.0, 0.0]])
+    clean_targ = torch.tensor([[1.0, 2.0], [3.0, 4.0], [0.0, 0.0], [0.0, 0.0]])
+    m_clean = _tensor_metrics("kv", base, clean_targ, [], None, valid_length=2)
+    assert m_clean["numeric_issue"] is None
+    assert m_clean["cosine_sim"] == pytest.approx(1.0)
+    assert m_clean["unused_slot_status"] == "clean_zero"
+
+    dirty_targ = torch.tensor([[1.0, 2.0], [3.0, 4.0], [0.25, 0.0], [0.0, 0.0]])
+    m_dirty = _tensor_metrics("kv", base, dirty_targ, [], None, valid_length=2)
+    assert m_dirty["numeric_issue"] is None
+    assert m_dirty["max_abs_err"] == 0.0
+    assert m_dirty["unused_slot_status"] == "finite_dirty"
+
+    polluted_targ = torch.tensor([[1.0, 2.0], [3.0, 4.0], [float("nan"), 0.0], [0.0, 0.0]])
+    m_polluted = _tensor_metrics("kv", base, polluted_targ, [], None, valid_length=2)
+    assert m_polluted["numeric_issue"] is None
+    assert m_polluted["unused_slot_status"] == "nonfinite_pollution"
+
+    zero_collapse = torch.zeros_like(base)
+    m_zero = _tensor_metrics("kv", base, zero_collapse, [], None, valid_length=2)
+    assert m_zero["numeric_issue"] == "target_zero_norm"
+    assert m_zero["cosine_sim"] is None
+
+    nan_active = torch.tensor([[1.0, float("nan")], [3.0, 4.0], [0.0, 0.0], [0.0, 0.0]])
+    m_nan = _tensor_metrics("kv", base, nan_active, [], None, valid_length=2)
+    assert m_nan["numeric_issue"] == "target_nan"
+    assert m_nan["cosine_sim"] is None
+
+    # Extreme finite float64 magnitudes must not overflow/underflow cosine_sim or false-trigger target_zero_norm
+    huge = torch.tensor([1e200, 1e200], dtype=torch.float64)
+    m_huge = _tensor_metrics("kv", huge, huge.clone(), [], None)
+    assert m_huge["numeric_issue"] is None
+    assert m_huge["cosine_sim"] == pytest.approx(1.0)
+
+    tiny = torch.tensor([1e-200, 1e-200], dtype=torch.float64)
+    m_tiny = _tensor_metrics("kv", tiny, -tiny, [], None)
+    assert m_tiny["numeric_issue"] is None
+    assert m_tiny["cosine_sim"] == pytest.approx(-1.0)
+

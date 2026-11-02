@@ -352,3 +352,57 @@ def test_cli_triage_remote_plog_guide_and_auto_container_discovery(tmp_path, mon
     assert out_container["failed_operator"] == "FlashAttentionScore"
     assert out_container["scanned_file_count"] == 1
     assert str(plog_file) in out_container["scanned_files"][0]
+
+
+def test_live_process_env_audit_and_runtime_guard_funnel(tmp_path, monkeypatch):
+    from mindie_debugger.cli import _inspect_live_process_env
+
+    proc_dir = tmp_path / "proc" / "4242"
+    proc_dir.mkdir(parents=True)
+    (proc_dir / "environ").write_bytes(
+        b"ASCEND_TOOLKIT_HOME=/usr/local/Ascend/ascend-toolkit/8.0\x00"
+        b"HCCL_DETERMINISTIC=false\x00"
+        b"VLLM_BATCH_INVARIANT=0\x00"
+    )
+    (proc_dir / "maps").write_text(
+        "\n".join([
+            "7f0000000000-7f0000100000 r-xp 00000000 08:01 101 /usr/local/Ascend/ascend-toolkit/8.0/lib64/libascendcl.so",
+            "7f0000100000-7f0000200000 r-xp 00000000 08:01 102 /usr/local/Ascend/nnal/atb/lib/libatb.so",
+            "7f0000200000-7f0000300000 r-xp 00000000 08:01 103 /usr/lib/x86_64-linux-gnu/libc.so.6",
+        ]),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("ASCEND_TOOLKIT_HOME", "/usr/local/Ascend/ascend-toolkit/latest")
+    monkeypatch.setenv("HCCL_DETERMINISTIC", "true")
+    monkeypatch.delenv("VLLM_BATCH_INVARIANT", raising=False)
+
+    audit = _inspect_live_process_env(4242, proc_root=tmp_path / "proc")
+    assert audit is not None
+    assert audit["pid"] == 4242
+    assert audit["has_env_drift"] is True
+    assert audit["env_drift_against_shell"]["ASCEND_TOOLKIT_HOME"] == {
+        "process_value": "/usr/local/Ascend/ascend-toolkit/8.0",
+        "shell_value": "/usr/local/Ascend/ascend-toolkit/latest",
+    }
+    assert audit["env_drift_against_shell"]["HCCL_DETERMINISTIC"] == {
+        "process_value": "false",
+        "shell_value": "true",
+    }
+    assert audit["loaded_ascend_so_count"] == 2
+    assert any("libascendcl.so" in p for p in audit["loaded_ascend_so_sample"])
+
+    numeric_res = triage_ascend_plog(
+        "[ERROR] VLLM_ASCEND(9301,9302):2026-09-22-18:03:00.000.000 "
+        "rank[0] deviceId:0 NaN/Inf overflow and cosine similarity determinism drift detected in MLA attention"
+    )
+    steps_joined = " ".join(numeric_res["remediation_steps"])
+    assert "runtime_guard" in steps_joined
+    assert "n_prompt + n_output - 1" in steps_joined
+    assert "summary_mode" in steps_joined
+
+    # Offline --text triage must NOT attach a local /proc/<pid> audit when --pid was not requested
+    import json
+    from mindie_debugger.cli import main
+
+    rc_text = main(["triage", "--text", "[ERROR] RUNTIME(4242,4243):2020-01-01-00:00:00.000.000 ErrCode=507015"])
+    assert rc_text == 0

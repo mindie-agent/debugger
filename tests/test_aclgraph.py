@@ -79,6 +79,59 @@ def test_aclgraph_address_tracker_catches_rebound_pointer_and_padded_slots():
     assert "rebound_pointer" in kinds
     assert "unmasked_padded_slot_mapping" in kinds
 
+    # KV bounds & block_table capacity verification (generalizing verify_request_kv)
+    active_bad_slots = torch.tensor([-1, 64, -1, -1], dtype=torch.int64)
+    block_table = torch.tensor([[0, 8, -1], [1, -1, -1]], dtype=torch.int32)
+    seq_lens = torch.tensor([20, 20], dtype=torch.int32)
+    kv_rep = tracker.verify_replay(
+        actual_tokens=2,
+        padded_tokens=4,
+        block_size=16,
+        num_blocks=4,
+        null_block_id=-1,
+        meta={
+            "slot_mapping": active_bad_slots,
+            "block_table": block_table,
+            "seq_lens": seq_lens,
+        },
+    )
+    assert kv_rep["status"] == "violation"
+    kv_kinds = {v["kind"] for v in kv_rep["violations"]}
+    assert "active_slot_out_of_bounds" in kv_kinds
+    assert "block_table_out_of_bounds" in kv_kinds
+    assert "block_table_capacity_insufficient" in kv_kinds
+
+    # Internal hole in required logical blocks ([1, -1, 2] for 32 tokens / block_size=16) must fail
+    hole_rep = tracker.verify_replay(
+        actual_tokens=2,
+        block_size=16,
+        num_blocks=4,
+        null_block_id=-1,
+        meta={
+            "slot_mapping": torch.tensor([0, 1], dtype=torch.int64),
+            "block_table": torch.tensor([[1, -1, 2]], dtype=torch.int32),
+            "seq_lens": torch.tensor([32], dtype=torch.int32),
+        },
+    )
+    assert hole_rep["status"] == "violation"
+    assert any(v["kind"] == "block_table_capacity_insufficient" for v in hole_rep["violations"])
+
+    # Context-parallel nonlocal active slots (-1) with local_slot_mask + sliding-window evicted null blocks
+    cp_swa_rep = tracker.verify_replay(
+        actual_tokens=4,
+        block_size=16,
+        num_blocks=4,
+        null_block_id=0,
+        sliding_window=32,
+        local_slot_mask=torch.tensor([True, False, True, False]),
+        meta={
+            "slot_mapping": torch.tensor([16, -1, 17, -1], dtype=torch.int64),
+            "block_table": torch.tensor([[0, 0, 1, 2]], dtype=torch.int32),
+            "seq_lens": torch.tensor([64], dtype=torch.int32),
+        },
+    )
+    assert cp_swa_rep["status"] == "ok"
+
 
 class _ProjWithStaleScale(torch.nn.Module):
     def __init__(self, stale_scale_buf: torch.Tensor):

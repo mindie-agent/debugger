@@ -425,9 +425,10 @@ MODEL_FAULT_REMEDIATIONS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
         ),
     ),
     "numerical_nan_inf_or_determinism_drift": (
-        ("msprobe", "HCCL_DETERMINISTIC=true", "LCCL_DETERMINISTIC=1", "VLLM_BATCH_INVARIANT=1", "asys"),
+        ("mindie-debugger", "runtime_guard", "msprobe", "HCCL_DETERMINISTIC=true", "LCCL_DETERMINISTIC=1", "VLLM_BATCH_INVARIANT=1", "asys"),
         (
-            'Run layerwise precision dump with msprobe: --additional-config \'{"dump_config": {"dump_path": "./msprobe_dump", "task": "statistics", "level": "L1", "summary_mode": "md5"}}\' and compare against CPU/GPU golden via `msprobe compare -i ./compare.json -o ./compare_out`.',
+            "For online vllm-ascend serving repeat/gibberish/NaN, enable runtime_guard (`token_repeat`, `logits_finite`, `spec_acceptance` + `dump_kv`), force-feed history `n_prompt + n_output - 1` under identical mode/topology, and run numeric-first KV & healed lockstep diff (`mindie-debugger precision` / `aclgraph`).",
+            'Run eager-only layerwise operator dump last with msprobe (`--enforce-eager`, `cudagraph_mode=NONE`): --additional-config \'{"dump_config": {"dump_path": "./msprobe_dump", "task": "statistics", "level": "L1", "summary_mode": "statistics"}}\' and scan `dump.json` in execution order for the first non-finite Max/Min/Mean/Norm.',
             "Enable bitwise deterministic execution: export HCCL_DETERMINISTIC=true LCCL_DETERMINISTIC=1 ATB_MATMUL_SHUFFLE_K_ENABLE=0 ATB_LLM_LCOC_ENABLE=0 and set VLLM_BATCH_INVARIANT=1 (or rl_config.enable_batch_invariant=true).",
             "For FP16 overflow (NaN/Inf in RoPE, MLA query-key scaling, or DeepSeek/Gemma residual accumulation), switch to --dtype bfloat16 or clamp FP32 accumulator scales.",
         ),
