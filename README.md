@@ -1,5 +1,9 @@
 # MindIE Debugger (`mindie-debugger`)
 
+<p>
+  <a href="https://github.com/mindie-agent/debugger/releases"><img src="https://img.shields.io/badge/Release-v0.1.0-blue" alt="Release v0.1.0"></a>
+</p>
+
 Target NPU workload debugger for Ascend (`vllm-ascend`, `MindIE-SD`, `MindIE-LLM`, `SGLang`, `sgl-kernel-npu`, and CANN operators).
 
 > **Domain Boundary**: `mindie-debugger` (`mindie_debugger`) exclusively targets **user NPU workloads** (CANN plog/AICore/HCCL fault triage, precision/memory-stomp debugging, and `ACLGraph` capture/replay debugging). MindIE Agent's own internal DFX logging, redaction, and GitHub Issue reporting live separately in `mindie-diagnostics` (`mindie_diagnostics`).

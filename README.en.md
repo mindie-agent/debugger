@@ -1,5 +1,9 @@
 # MindIE Debugger (`mindie-debugger`)
 
+<p>
+  <a href="https://github.com/mindie-agent/debugger/releases"><img src="https://img.shields.io/badge/Release-v0.1.0-blue" alt="Release v0.1.0"></a>
+</p>
+
 [中文](README.md)
 
 `mindie-debugger` (Python package `mindie_debugger`) is MindIE Agent's deterministic Ascend NPU workload fault-triage and precision/memory-stomp localization component, strictly separated from [`diagnostics`](https://github.com/mindie-agent/diagnostics) (which handles MindIE Agent's own internal DFX logging and opt-in GitHub Issue reporting).
