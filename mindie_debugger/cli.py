@@ -10,9 +10,8 @@
   * All subcommands emit single-line ASCII JSON to stdout.
   * Triage and `remote-guide` subcommands are zero-NPU-dependency (`torch` is
     imported lazily only by precision/aclgraph runtime hooks).
-  * When an NPU-dependent command is invoked on a host without `torch_npu` /
-    `vllm` / NPU runtime, `mindie-debugger` stages a clean pure-Python bundle
-    locally and emits a `remote_npu_execution_guide` for `remote-dev`.
+  * Local argument errors exit 1 with `status=error`. Missing `torch_npu` /
+    `libhccl.so` on an NPU command may attach a remote guide but still exits 1.
 
 [Timeouts & Locks]
   Single-invocation CLI; acquires no locks and spawns no background threads.
@@ -67,10 +66,9 @@ def _build_remote_execution_guide(
     quoted_args = " ".join(shlex.quote(a) for a in (argv or ["triage"]))
     return {
         "summary": (
-            "CANN plogs ($ASCEND_PROCESS_LOG_PATH or ~/ascend/log/debug/plog), dynamic ACLGraph tools, and "
-            "NPU precision tools reside/execute inside the target Ascend NPU container. Push the staged "
-            "pure-Python `mindie_debugger` bundle to the remote NPU container with "
-            "`mcp__remote-dev__remote_artifact_push` and execute it in-place with `mcp__remote-dev__remote_bash`."
+            "CANN plogs, ACLGraph, and NPU precision tools run on the target Ascend host. "
+            "Copy the staged pure-Python bundle from local_bundle_path with scp/rsync/SSH "
+            "or optional remote-dev tools, then run the CLI there."
         ),
         "local_bundle_path": str(bundle_path),
         "remote_stage_path": ".mindie_debugger/mindie_debugger",
@@ -269,8 +267,16 @@ def _jsonable(value, depth=0):
     return str(value)
 
 
+_JSON_TRACE_MAX_BYTES = 50 * 1024 * 1024
+
+
 def _read_json(path):
-    with open(path, "r", encoding="utf-8") as handle:
+    target = Path(path)
+    size = target.stat().st_size
+    if size > _JSON_TRACE_MAX_BYTES:
+        raise ValueError(
+            f"JSON file '{target}' is {size} bytes, exceeding the {_JSON_TRACE_MAX_BYTES}-byte limit")
+    with target.open("r", encoding="utf-8") as handle:
         return json.load(handle)
 
 
@@ -347,10 +353,12 @@ def _precision_compare(baseline_path, target_path):
 
 
 def _is_npu_env_missing_error(exc: BaseException) -> bool:
-    if isinstance(exc, ModuleNotFoundError):
+    name = (getattr(exc, "name", None) or "").split(".")[0].lower()
+    text = str(exc).lower()
+    if isinstance(exc, ModuleNotFoundError) and (
+            name == "torch_npu" or "no module named 'torch_npu'" in text):
         return True
-    msg = f"{type(exc).__name__}: {exc}".lower()
-    return any(tok in msg for tok in ("torch_npu", "vllm", "npu", "ascend", "cann", "triton", "mindie"))
+    return any(token in text for token in ("libhccl.so", "libascendcl.so", "libtorch_npu.so"))
 
 
 def _run_precision(args, raw_argv: list[str] | None = None):
@@ -405,7 +413,7 @@ def _run_precision(args, raw_argv: list[str] | None = None):
                 "status": "remote_npu_execution_required",
                 "local_missing_environment": f"{type(exc).__name__}: {exc}",
                 "remote_npu_execution_guide": _build_remote_execution_guide(raw_argv),
-            }, 0
+            }, 1
         raise
     if action == "compare-traces":
         baseline = getattr(args, "baseline", None) or args.baseline_opt
@@ -445,10 +453,7 @@ _FAULT_HINT_RE = re.compile(
 
 
 def _read_bounded_log_text(path: Path, max_bytes: int = 4 * 1024 * 1024) -> str:
-    try:
-        size = path.stat().st_size
-    except OSError:
-        return ""
+    size = path.stat().st_size
     if size <= max_bytes:
         return path.read_text(encoding="utf-8", errors="replace")
     head_bytes = 256 * 1024
@@ -562,10 +567,7 @@ def _triage_directory(
             continue
         if pid_token is not None and f"plog-{pid_token}_" not in path.name and pid_token not in path.name:
             continue
-        try:
-            mtime = path.stat().st_mtime
-        except OSError:
-            mtime = 0.0
+        mtime = path.stat().st_mtime
         candidates.append((mtime, path))
     if not candidates:
         return "", []
@@ -604,16 +606,16 @@ def _run_aclgraph(args, raw_argv: list[str] | None = None):
     target_arg = getattr(args, "script", None) or getattr(args, "target", None)
     if not target_arg and not getattr(args, "callable", None):
         return {
-            "status": "remote_npu_execution_required",
-            "reason": "Provide --script <repro.py> or --callable <mod:fn> inside the NPU container",
-            "remote_npu_execution_guide": _build_remote_execution_guide(raw_argv),
-        }, 0
-    if target_arg and Path(target_arg).exists() and Path(target_arg).is_dir():
-        return {
-            "status": "remote_npu_execution_required",
-            "reason": f"'{target_arg}' is a source directory; dynamic ACLGraph inspection requires running a script or pytest inside the NPU container.",
-            "remote_npu_execution_guide": _build_remote_execution_guide(raw_argv),
-        }, 0
+            "status": "error",
+            "reason": "script_or_callable_required",
+            "error": "Provide --script <repro.py> or --callable <mod:fn>.",
+        }, 1
+    if target_arg:
+        script_path = Path(target_arg)
+        if not script_path.is_file():
+            reason = "script_path_not_found" if not script_path.exists() else "script_path_is_directory"
+            return {"status": "error", "reason": reason, "path": str(script_path),
+                    "error": f"Script path '{script_path}' must be an existing file."}, 1
     if action == "guard":
         err_info = None
         exc_obj = None
@@ -632,7 +634,7 @@ def _run_aclgraph(args, raw_argv: list[str] | None = None):
                 "status": "remote_npu_execution_required",
                 "local_missing_environment": err_info,
                 "remote_npu_execution_guide": _build_remote_execution_guide(raw_argv),
-            }, 0
+            }, 1
         if err_info:
             rep["exception"] = err_info
         code = 0 if (rep["status"] == "ok" and err_info is None) else 1
@@ -668,12 +670,73 @@ def _run_aclgraph(args, raw_argv: list[str] | None = None):
                 "status": "remote_npu_execution_required",
                 "local_missing_environment": err_info,
                 "remote_npu_execution_guide": _build_remote_execution_guide(raw_argv),
-            }, 0
+            }, 1
         if err_info:
             rep["exception"] = err_info
         code = 0 if (rep["status"] == "ok" and err_info is None) else 1
         return rep, code
     return {"status": "error", "reason": "unknown_aclgraph_action"}, 2
+
+
+def _print_error(reason: str, **fields) -> int:
+    print(json.dumps({"status": "error", "reason": reason, **fields}, ensure_ascii=True, default=str))
+    return 1
+
+
+def _run_triage(args, raw_argv: list[str]) -> int:
+    from .npu_fault_triage import triage_npu_fault
+    scanned_files: list[str] = []
+    explicit_path = getattr(args, "root", None) or getattr(args, "file", None) or getattr(args, "target", None)
+    if args.text is not None:
+        text = args.text
+    elif explicit_path:
+        target_path = Path(explicit_path).expanduser()
+        if not target_path.exists():
+            return _print_error(
+                "log_path_not_found",
+                path=str(target_path),
+                error=f"Log path '{target_path}' does not exist.",
+            )
+        if target_path.is_dir():
+            text, scanned_files = _triage_directory(
+                target_path, pid=args.pid, latest=args.latest, window_sec=args.window_sec
+            )
+        else:
+            text, scanned_files = _read_bounded_log_text(target_path), [str(target_path)]
+    else:
+        stdin_text = ""
+        if not sys.stdin.isatty() and args.pid is None:
+            stdin_text = sys.stdin.read()
+        if stdin_text.strip():
+            text, scanned_files = stdin_text, ["<stdin>"]
+        else:
+            default_root = _default_cann_log_root()
+            if default_root is None:
+                return _print_error(
+                    "no_log_input",
+                    error=(
+                        "No --text/--file/--root provided and default CANN plog directory "
+                        "($ASCEND_PROCESS_LOG_PATH or ~/ascend/log) was not found. "
+                        "Pass a local log or --text, or scp/SSH the bundle to the NPU host."
+                    ),
+                )
+            text, scanned_files = _triage_directory(
+                default_root, pid=args.pid, latest=args.latest, window_sec=args.window_sec
+            )
+    payload = triage_npu_fault(text)
+    if scanned_files:
+        payload["scanned_file_count"] = len(scanned_files)
+        payload["scanned_files"] = scanned_files[:16]
+    live_env = (
+        _inspect_live_process_env(args.pid)
+        if (args.pid is not None and not args.text and not args.file)
+        else None
+    )
+    if live_env is not None:
+        payload["live_process_env_audit"] = live_env
+    payload["remote_npu_execution_guide"] = _build_remote_execution_guide(raw_argv)
+    print(json.dumps(payload, ensure_ascii=True))
+    return 0
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -688,72 +751,18 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(decode_cann_error_code(args.code), ensure_ascii=True))
         return 0
     if args.command == "triage":
-        from .npu_fault_triage import triage_npu_fault
-        scanned_files: list[str] = []
-        explicit_path = getattr(args, "root", None) or getattr(args, "file", None) or getattr(args, "target", None)
-        if args.text is not None:
-            text = args.text
-        elif explicit_path:
-            target_path = Path(explicit_path).expanduser()
-            if not target_path.exists():
-                print(json.dumps({
-                    "status": "remote_npu_execution_required",
-                    "reason": (
-                        f"Log path '{target_path}' does not exist on the local host; CANN plogs "
-                        "($ASCEND_PROCESS_LOG_PATH or ~/ascend/log/debug/plog) reside inside the remote NPU container."
-                    ),
-                    "remote_npu_execution_guide": _build_remote_execution_guide(raw_argv),
-                }, ensure_ascii=True))
-                return 0
-            if target_path.is_dir():
-                text, scanned_files = _triage_directory(
-                    target_path, pid=args.pid, latest=args.latest, window_sec=args.window_sec
-                )
-            else:
-                text, scanned_files = _read_bounded_log_text(target_path), [str(target_path)]
-        else:
-            stdin_text = ""
-            if not sys.stdin.isatty() and args.pid is None:
-                try:
-                    stdin_text = sys.stdin.read()
-                except TimeoutError:
-                    raise
-                except OSError:
-                    stdin_text = ""
-            if stdin_text.strip():
-                text, scanned_files = stdin_text, ["<stdin>"]
-            else:
-                default_root = _default_cann_log_root()
-                if default_root is not None:
-                    text, scanned_files = _triage_directory(
-                        default_root, pid=args.pid, latest=args.latest, window_sec=args.window_sec
-                    )
-                else:
-                    print(json.dumps({
-                        "status": "remote_npu_execution_required",
-                        "reason": (
-                            "No inline --text provided and default CANN plog directory "
-                            "($ASCEND_PROCESS_LOG_PATH or ~/ascend/log) was not found on the local host. "
-                            "Push mindie_debugger to the remote NPU container and run `triage` there, "
-                            "or pass `--text '<error snippet>'`."
-                        ),
-                        "remote_npu_execution_guide": _build_remote_execution_guide(["triage"]),
-                    }, ensure_ascii=True))
-                    return 0
-        payload = triage_npu_fault(text)
-        if scanned_files:
-            payload["scanned_file_count"] = len(scanned_files)
-            payload["scanned_files"] = scanned_files[:16]
-        live_env = (
-            _inspect_live_process_env(args.pid)
-            if (args.pid is not None and not args.text and not args.file)
-            else None
-        )
-        if live_env is not None:
-            payload["live_process_env_audit"] = live_env
-        payload["remote_npu_execution_guide"] = _build_remote_execution_guide(raw_argv)
-        print(json.dumps(payload, ensure_ascii=True))
-        return 0
+        try:
+            return _run_triage(args, raw_argv)
+        except TimeoutError:
+            raise
+        except OSError as exc:
+            return _print_error(
+                "log_read_failed",
+                error_type=type(exc).__name__,
+                error=str(exc)[:240],
+                errno=exc.errno,
+                path=getattr(exc, "filename", None),
+            )
     if args.command == "aclgraph":
         try:
             result, code = _run_aclgraph(args, raw_argv)
