@@ -326,13 +326,14 @@ def test_cli_triage_remote_plog_guide_and_auto_container_discovery(tmp_path, mon
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
     monkeypatch.delenv("ASCEND_PROCESS_LOG_PATH", raising=False)
 
-    # 1. Local host with nonexistent remote container path -> returns remote_npu_execution_required
+    # 1. Explicit missing --root is a local path error (exit 1), not a fake remote-NPU success
     rc = main(["triage", "--root", str(tmp_path / "nonexistent_container_plog")])
-    assert rc == 0
+    assert rc == 1
     out_missing = json.loads(capsys.readouterr().out)
-    assert out_missing["status"] == "remote_npu_execution_required"
-    assert "remote_npu_execution_guide" in out_missing
-    assert "triage_cann_plog_auto" in out_missing["remote_npu_execution_guide"]["step_2_execute_cli_in_npu_container"]["cli_examples"]
+    assert out_missing["status"] == "error"
+    assert out_missing["reason"] == "log_path_not_found"
+    assert "nonexistent_container_plog" in out_missing["path"]
+    assert "remote_npu_execution_guide" not in out_missing
 
     # 2. Inside remote container: ASCEND_PROCESS_LOG_PATH auto-discovery + --pid filter
     plog_dir = tmp_path / "container_ascend_log" / "debug" / "plog"
