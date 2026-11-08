@@ -160,6 +160,54 @@ def test_triage_unreadable_file_is_not_reported_clean(tmp_path, monkeypatch, cap
     assert "scanned_files" not in payload
 
 
+def test_triage_direntry_is_dir_oserror_is_not_empty_success(tmp_path, monkeypatch, capsys):
+    root = tmp_path / "logs"
+    nested = root / "rank0"
+    nested.mkdir(parents=True)
+    (nested / "plog-1.log").write_text("[ERROR] RUNTIME ErrCode=507015\n", encoding="utf-8")
+    blocked = os.path.abspath(str(nested))
+    real_scandir = os.scandir
+
+    class EntryProxy:
+        def __init__(self, entry):
+            self._entry = entry
+            self.path = entry.path
+            self.name = entry.name
+
+        def is_dir(self, *args, **kwargs):
+            if os.path.abspath(self.path) == blocked:
+                raise PermissionError(13, "Permission denied", self.path)
+            return self._entry.is_dir(*args, **kwargs)
+
+        def is_file(self, *args, **kwargs):
+            return self._entry.is_file(*args, **kwargs)
+
+    class ScandirProxy:
+        def __init__(self, inner):
+            self._inner = inner
+
+        def __enter__(self):
+            self._inner.__enter__()
+            return self
+
+        def __exit__(self, *args):
+            return self._inner.__exit__(*args)
+
+        def __iter__(self):
+            for entry in self._inner:
+                yield EntryProxy(entry)
+
+    monkeypatch.setattr(os, "scandir", lambda path: ScandirProxy(real_scandir(path)))
+    rc = cli.main(["triage", "--root", str(root)])
+    payload = _stdout_json(capsys)
+    assert rc == 1
+    assert payload["status"] == "error"
+    assert payload["reason"] == "log_read_failed"
+    assert payload["error_type"] == "PermissionError"
+    assert payload.get("fault_domain") is None
+    assert "scanned_files" not in payload
+
+
 def test_triage_nested_unreadable_dir_is_not_empty_success(tmp_path, monkeypatch, capsys):
     root = tmp_path / "logs"
     nested = root / "rank0"

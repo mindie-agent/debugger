@@ -554,8 +554,19 @@ def _default_cann_log_root() -> Path | None:
     return None
 
 
-def _reraise(err):
-    raise err
+def _iter_regular_files(root: Path):
+    pending = [root]
+    while pending:
+        current = pending.pop()
+        with os.scandir(current) as iterator:
+            entries = list(iterator)
+        for entry in entries:
+            is_dir = entry.is_dir(follow_symlinks=False)
+            is_file = entry.is_file(follow_symlinks=False)
+            if is_dir:
+                pending.append(Path(entry.path))
+            elif is_file:
+                yield Path(entry.path)
 
 
 def _triage_directory(
@@ -568,15 +579,13 @@ def _triage_directory(
     rank_pat = re.compile(r"(?:rank|device)[_-]?(\d+)", re.IGNORECASE)
     pid_token = str(pid) if pid is not None else None
     candidates: list[tuple[float, Path]] = []
-    for dirpath, _, filenames in os.walk(root_dir, onerror=_reraise):
-        for name in filenames:
-            path = Path(dirpath) / name
-            if path.suffix.lower() not in (".log", ".txt", ".out", ".err") and not path.name.startswith(("plog", "device-")):
-                continue
-            if pid_token is not None and f"plog-{pid_token}_" not in path.name and pid_token not in path.name:
-                continue
-            mtime = path.stat().st_mtime
-            candidates.append((mtime, path))
+    for path in _iter_regular_files(root_dir):
+        if path.suffix.lower() not in (".log", ".txt", ".out", ".err") and not path.name.startswith(("plog", "device-")):
+            continue
+        if pid_token is not None and f"plog-{pid_token}_" not in path.name and pid_token not in path.name:
+            continue
+        mtime = path.stat().st_mtime
+        candidates.append((mtime, path))
     if not candidates:
         return "", []
     candidates.sort(key=lambda item: (item[0], str(item[1])), reverse=True)
