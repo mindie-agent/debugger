@@ -35,12 +35,14 @@ def _stdout_json(capsys) -> dict:
 def test_npu_env_missing_matcher_rejects_local_errors():
     requests_exc = ModuleNotFoundError("No module named 'requests'", name="requests")
     path_exc = FileNotFoundError(2, "No such file", "/tmp/mindie/ascend/npu/vllm/cann.log")
+    so_path_exc = FileNotFoundError(2, "No such file", "/tmp/notes/libhccl.so.bak")
     value_exc = ValueError("invalid mindie/ascend/npu json")
     torch_exc = ModuleNotFoundError("No module named 'torch_npu'", name="torch_npu")
-    so_exc = OSError("libhccl.so: cannot open shared object file")
+    so_exc = ImportError("libhccl.so: cannot open shared object file")
 
     assert cli._is_npu_env_missing_error(requests_exc) is False
     assert cli._is_npu_env_missing_error(path_exc) is False
+    assert cli._is_npu_env_missing_error(so_path_exc) is False
     assert cli._is_npu_env_missing_error(value_exc) is False
     assert cli._is_npu_env_missing_error(torch_exc) is True
     assert cli._is_npu_env_missing_error(so_exc) is True
@@ -70,7 +72,7 @@ def test_precision_missing_torch_npu_exits_nonzero_with_optional_guide(monkeypat
 
 
 def test_precision_missing_capsule_with_npu_tokens_in_path_is_local_error(tmp_path, capsys):
-    missing = tmp_path / "npu_ascend_mindie_vllm.pt"
+    missing = tmp_path / "libhccl.so"
     rc = cli.main(["precision", "inspect-capsule", str(missing)])
     payload = _stdout_json(capsys)
     assert rc == 1
@@ -158,6 +160,29 @@ def test_triage_unreadable_file_is_not_reported_clean(tmp_path, monkeypatch, cap
     assert "scanned_files" not in payload
 
 
+def test_triage_nested_unreadable_dir_is_not_empty_success(tmp_path, monkeypatch, capsys):
+    root = tmp_path / "logs"
+    nested = root / "rank0"
+    nested.mkdir(parents=True)
+    (nested / "plog-1.log").write_text("[ERROR] RUNTIME ErrCode=507015\n", encoding="utf-8")
+    blocked = os.path.abspath(str(nested))
+    real_scandir = os.scandir
+
+    def selective(path):
+        if os.path.abspath(path) == blocked:
+            raise PermissionError(13, "Permission denied", str(path))
+        return real_scandir(path)
+
+    monkeypatch.setattr(os, "scandir", selective)
+    rc = cli.main(["triage", "--root", str(root)])
+    payload = _stdout_json(capsys)
+    assert rc == 1
+    assert payload["status"] == "error"
+    assert payload["reason"] == "log_read_failed"
+    assert payload.get("fault_domain") is None
+    assert "scanned_files" not in payload
+
+
 def test_triage_directory_unreadable_member_is_not_reported_clean(tmp_path, monkeypatch, capsys):
     root = tmp_path / "logs"
     root.mkdir()
@@ -219,11 +244,34 @@ def test_read_json_rejects_oversized_trace_and_allows_limit(tmp_path, monkeypatc
     monkeypatch.setattr(cli, "_JSON_TRACE_MAX_BYTES", 32)
     big = tmp_path / "big.json"
     big.write_text(payload + (" " * 64), encoding="utf-8")
-    with pytest.raises(ValueError, match="exceeding") as info:
+    with pytest.raises(ValueError, match="exceed") as info:
         cli._read_json(big)
     message = str(info.value)
     assert str(big) in message
-    assert str(big.stat().st_size) in message
+    assert str(cli._JSON_TRACE_MAX_BYTES) in message
+
+
+def test_read_json_enforces_limit_despite_stale_stat(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(cli, "_JSON_TRACE_MAX_BYTES", 32)
+    path = tmp_path / "grow.json"
+    path.write_text('{"metrics":[]}' + (" " * 64), encoding="utf-8")
+    real_stat = Path.stat
+
+    def tiny_stat(self, *args, **kwargs):
+        if os.path.abspath(os.fspath(self)) == os.path.abspath(str(path)):
+            return type("S", (), {"st_size": 8})()
+        return real_stat(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", tiny_stat)
+    with pytest.raises(ValueError, match="exceed"):
+        cli._read_json(path)
+    small = tmp_path / "small.json"
+    small.write_text('{"metrics":[]}', encoding="utf-8")
+    rc = cli.main(["precision", "compare-traces", str(path), str(small)])
+    payload = _stdout_json(capsys)
+    assert rc == 1
+    assert payload["status"] == "error"
+    assert payload["error_type"] == "ValueError"
 
 
 def test_compare_traces_and_watch_reject_oversized_json(tmp_path, monkeypatch, capsys):

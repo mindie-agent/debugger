@@ -272,12 +272,13 @@ _JSON_TRACE_MAX_BYTES = 50 * 1024 * 1024
 
 def _read_json(path):
     target = Path(path)
-    size = target.stat().st_size
-    if size > _JSON_TRACE_MAX_BYTES:
+    with target.open("rb") as handle:
+        data = handle.read(_JSON_TRACE_MAX_BYTES + 1)
+    if len(data) > _JSON_TRACE_MAX_BYTES:
         raise ValueError(
-            f"JSON file '{target}' is {size} bytes, exceeding the {_JSON_TRACE_MAX_BYTES}-byte limit")
-    with target.open("r", encoding="utf-8") as handle:
-        return json.load(handle)
+            f"JSON file '{target}' exceeded the {_JSON_TRACE_MAX_BYTES}-byte limit "
+            f"(read {len(data)} bytes)")
+    return json.loads(data.decode("utf-8"))
 
 
 def _import_callable(spec):
@@ -353,12 +354,15 @@ def _precision_compare(baseline_path, target_path):
 
 
 def _is_npu_env_missing_error(exc: BaseException) -> bool:
-    name = (getattr(exc, "name", None) or "").split(".")[0].lower()
-    text = str(exc).lower()
-    if isinstance(exc, ModuleNotFoundError) and (
-            name == "torch_npu" or "no module named 'torch_npu'" in text):
-        return True
-    return any(token in text for token in ("libhccl.so", "libascendcl.so", "libtorch_npu.so"))
+    if isinstance(exc, ModuleNotFoundError):
+        name = (getattr(exc, "name", None) or "").split(".")[0].lower()
+        return name == "torch_npu" or "no module named 'torch_npu'" in str(exc).lower()
+    if isinstance(exc, (FileNotFoundError, PermissionError, IsADirectoryError, NotADirectoryError)):
+        return False
+    if isinstance(exc, (ImportError, OSError)):
+        text = str(exc).lower()
+        return any(token in text for token in ("libhccl.so", "libascendcl.so", "libtorch_npu.so"))
+    return False
 
 
 def _run_precision(args, raw_argv: list[str] | None = None):
@@ -550,6 +554,10 @@ def _default_cann_log_root() -> Path | None:
     return None
 
 
+def _reraise(err):
+    raise err
+
+
 def _triage_directory(
     root_dir: Path,
     *,
@@ -560,15 +568,15 @@ def _triage_directory(
     rank_pat = re.compile(r"(?:rank|device)[_-]?(\d+)", re.IGNORECASE)
     pid_token = str(pid) if pid is not None else None
     candidates: list[tuple[float, Path]] = []
-    for path in root_dir.rglob("*"):
-        if not path.is_file():
-            continue
-        if path.suffix.lower() not in (".log", ".txt", ".out", ".err") and not path.name.startswith(("plog", "device-")):
-            continue
-        if pid_token is not None and f"plog-{pid_token}_" not in path.name and pid_token not in path.name:
-            continue
-        mtime = path.stat().st_mtime
-        candidates.append((mtime, path))
+    for dirpath, _, filenames in os.walk(root_dir, onerror=_reraise):
+        for name in filenames:
+            path = Path(dirpath) / name
+            if path.suffix.lower() not in (".log", ".txt", ".out", ".err") and not path.name.startswith(("plog", "device-")):
+                continue
+            if pid_token is not None and f"plog-{pid_token}_" not in path.name and pid_token not in path.name:
+                continue
+            mtime = path.stat().st_mtime
+            candidates.append((mtime, path))
     if not candidates:
         return "", []
     candidates.sort(key=lambda item: (item[0], str(item[1])), reverse=True)
@@ -692,11 +700,8 @@ def _run_triage(args, raw_argv: list[str]) -> int:
     elif explicit_path:
         target_path = Path(explicit_path).expanduser()
         if not target_path.exists():
-            return _print_error(
-                "log_path_not_found",
-                path=str(target_path),
-                error=f"Log path '{target_path}' does not exist.",
-            )
+            return _print_error("log_path_not_found", path=str(target_path),
+                                error=f"Log path '{target_path}' does not exist.")
         if target_path.is_dir():
             text, scanned_files = _triage_directory(
                 target_path, pid=args.pid, latest=args.latest, window_sec=args.window_sec
@@ -712,14 +717,10 @@ def _run_triage(args, raw_argv: list[str]) -> int:
         else:
             default_root = _default_cann_log_root()
             if default_root is None:
-                return _print_error(
-                    "no_log_input",
-                    error=(
-                        "No --text/--file/--root provided and default CANN plog directory "
-                        "($ASCEND_PROCESS_LOG_PATH or ~/ascend/log) was not found. "
-                        "Pass a local log or --text, or scp/SSH the bundle to the NPU host."
-                    ),
-                )
+                return _print_error("no_log_input", error=(
+                    "No --text/--file/--root provided and default CANN plog directory "
+                    "($ASCEND_PROCESS_LOG_PATH or ~/ascend/log) was not found. "
+                    "Pass a local log or --text, or scp/SSH the bundle to the NPU host."))
             text, scanned_files = _triage_directory(
                 default_root, pid=args.pid, latest=args.latest, window_sec=args.window_sec
             )
@@ -756,13 +757,9 @@ def main(argv: list[str] | None = None) -> int:
         except TimeoutError:
             raise
         except OSError as exc:
-            return _print_error(
-                "log_read_failed",
-                error_type=type(exc).__name__,
-                error=str(exc)[:240],
-                errno=exc.errno,
-                path=getattr(exc, "filename", None),
-            )
+            return _print_error("log_read_failed", error_type=type(exc).__name__,
+                                error=str(exc)[:240], errno=exc.errno,
+                                path=getattr(exc, "filename", None))
     if args.command == "aclgraph":
         try:
             result, code = _run_aclgraph(args, raw_argv)
