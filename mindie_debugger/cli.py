@@ -561,9 +561,10 @@ def _iter_regular_files(root: Path):
         with os.scandir(current) as iterator:
             entries = list(iterator)
         for entry in entries:
+            is_symlink = entry.is_symlink()
             is_dir = entry.is_dir(follow_symlinks=False)
-            is_file = entry.is_file(follow_symlinks=False)
-            if is_dir:
+            is_file = entry.is_file(follow_symlinks=True)
+            if is_dir and not is_symlink:
                 pending.append(Path(entry.path))
             elif is_file:
                 yield Path(entry.path)

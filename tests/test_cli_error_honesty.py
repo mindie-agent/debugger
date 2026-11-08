@@ -8,6 +8,7 @@
 [Invariants]
   * Path typos and unrelated ModuleNotFoundError are not classified as missing NPU.
   * Log stat/read/stdin OSError exits 1; TimeoutError is re-raised, never "".
+  * Directory walk yields file symlinks to regular logs; metadata I/O still fails.
   * compare-traces / watch reject JSON files above the 50 MiB cap.
 
 [Timeouts & Locks]
@@ -182,6 +183,9 @@ def test_triage_direntry_is_dir_oserror_is_not_empty_success(tmp_path, monkeypat
         def is_file(self, *args, **kwargs):
             return self._entry.is_file(*args, **kwargs)
 
+        def is_symlink(self):
+            return self._entry.is_symlink()
+
     class ScandirProxy:
         def __init__(self, inner):
             self._inner = inner
@@ -206,6 +210,43 @@ def test_triage_direntry_is_dir_oserror_is_not_empty_success(tmp_path, monkeypat
     assert payload["error_type"] == "PermissionError"
     assert payload.get("fault_domain") is None
     assert "scanned_files" not in payload
+
+
+def _symlink_or_skip(link: Path, target: Path) -> None:
+    try:
+        link.symlink_to(target, target_is_directory=target.is_dir())
+    except OSError as exc:
+        pytest.skip(f"cannot create symlink: {exc}")
+
+
+def test_triage_symlink_to_regular_log_is_not_empty_success(tmp_path, capsys):
+    root = tmp_path / "logs"
+    root.mkdir()
+    real = tmp_path / "outside" / "device-0.log"
+    real.parent.mkdir()
+    real.write_text("[ERROR] RUNTIME ErrCode=507015\n", encoding="utf-8")
+    link = root / "plog-1.log"
+    _symlink_or_skip(link, real)
+    found = list(cli._iter_regular_files(root))
+    assert found == [link]
+    rc = cli.main(["triage", "--root", str(root)])
+    payload = _stdout_json(capsys)
+    assert rc == 0
+    assert payload.get("status") != "error"
+    assert payload["scanned_file_count"] == 1
+    assert str(link) in payload["scanned_files"][0]
+    assert "507015" in payload["error_codes"]
+
+
+def test_iter_regular_files_skips_directory_symlink_without_loop(tmp_path):
+    root = tmp_path / "logs"
+    nested = root / "rank0"
+    nested.mkdir(parents=True)
+    log = nested / "plog-1.log"
+    log.write_text("[ERROR] RUNTIME ErrCode=507015\n", encoding="utf-8")
+    _symlink_or_skip(root / "loop", root)
+    found = list(cli._iter_regular_files(root))
+    assert found == [log]
 
 
 def test_triage_nested_unreadable_dir_is_not_empty_success(tmp_path, monkeypatch, capsys):
