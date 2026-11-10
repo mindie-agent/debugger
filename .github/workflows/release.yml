@@ -12,6 +12,8 @@ permissions:
 jobs:
   release:
     uses: mindie-agent/mindie-bench/.github/workflows/publish-release.yml@main
+    secrets:
+      MINDIE_RELEASE_DEPLOY_KEY: ${{ secrets.MINDIE_RELEASE_DEPLOY_KEY }}
     with:
       release-notes-path: docs/releases/mindie-debugger-0.1.0.md
       setup-command: |
