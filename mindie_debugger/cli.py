@@ -655,8 +655,8 @@ def _run_aclgraph(args, raw_argv: list[str] | None = None):
             }, 1
         if err_info:
             rep["exception"] = err_info
-        code = 0 if (rep["status"] == "ok" and err_info is None) else 1
-        return rep, code
+            rep["status"] = "error" if rep["status"] in {"ok", "clean"} else rep["status"]
+        return rep, (0 if rep["status"] in {"ok", "clean"} and err_info is None else 1)
     if action == "inspect":
         include = tuple(p.strip() for p in str(args.include).split(",") if p.strip()) or ("*",)
         err_info = None
@@ -691,8 +691,8 @@ def _run_aclgraph(args, raw_argv: list[str] | None = None):
             }, 1
         if err_info:
             rep["exception"] = err_info
-        code = 0 if (rep["status"] == "ok" and err_info is None) else 1
-        return rep, code
+            rep["status"] = "error" if rep["status"] in {"ok", "clean"} else rep["status"]
+        return rep, (0 if rep["status"] in {"ok", "clean"} and err_info is None else 1)
     return {"status": "error", "reason": "unknown_aclgraph_action"}, 2
 
 

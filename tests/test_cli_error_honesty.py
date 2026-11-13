@@ -95,6 +95,69 @@ def test_aclgraph_missing_script_and_typo_path_are_local_errors(tmp_path, capsys
     assert payload["reason"] == "script_path_not_found"
 
 
+def test_aclgraph_guard_and_inspect_target_exceptions_never_report_ok_or_clean(monkeypatch, capsys):
+    class _NoopGuard:
+        def __init__(self, *, strict=False):
+            self.violations = []
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def report(self):
+            return {
+                "status": "clean" if not self.violations else "capture_hazard",
+                "violation_count": len(self.violations),
+                "first_violation": None,
+                "violations": list(self.violations),
+            }
+
+    class _NoopInspector:
+        def __init__(self, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def report(self):
+            return {
+                "status": "ok",
+                "capture_guard_violations": [],
+                "address_violations": [],
+                "layer_diffs": [],
+                "first_divergent_layer": None,
+            }
+
+    import mindie_debugger.aclgraph as aclgraph_mod
+
+    monkeypatch.setattr(aclgraph_mod, "ACLGraphCaptureGuard", _NoopGuard)
+    monkeypatch.setattr(aclgraph_mod, "ACLGraphVllmInspector", _NoopInspector)
+
+    # math:sqrt called with 0 args raises TypeError; JSON status must be "error", never "ok"/"clean".
+    rc = cli.main(["aclgraph", "inspect", "--callable", "math:sqrt"])
+    payload = _stdout_json(capsys)
+    assert rc == 1
+    assert payload["status"] == "error"
+    assert "TypeError" in payload["exception"]
+
+    rc = cli.main(["aclgraph", "guard", "--callable", "math:sqrt"])
+    payload = _stdout_json(capsys)
+    assert rc == 1
+    assert payload["status"] == "error"
+    assert "TypeError" in payload["exception"]
+
+    # Clean zero-arg callable returns exit 0 with honest clean/ok status.
+    rc = cli.main(["aclgraph", "guard", "--callable", "sys:getdefaultencoding"])
+    payload = _stdout_json(capsys)
+    assert rc == 0
+    assert payload["status"] == "clean"
+
+
 def test_triage_without_input_is_error_not_remote_success(capsys, monkeypatch):
     class EmptyStdin:
         def isatty(self):
