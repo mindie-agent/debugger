@@ -37,6 +37,7 @@ import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
+from ..observability import call_user_target, mark_user_target_error
 from .storage_graph import (
     _live_module_map,
     _require_torch,
@@ -110,7 +111,7 @@ def capture_call(fn_or_module, *args, save_path=None, metadata=None, **kwargs):
     collective_trace = []
     try:
         with trace_collectives(torch, collective_trace):
-            result = fn_or_module(*args, **kwargs)
+            result = call_user_target(fn_or_module, *args, **kwargs)
     except BaseException as exc:
         error = exc
         raise
@@ -181,7 +182,11 @@ def _resolve_callable(capsule, fn_or_module):
         for part in qualname.split("."):
             target = getattr(target, part)
     except (ImportError, AttributeError) as exc:
+        mark_user_target_error(exc)
         raise ValueError("callable reconstruction requires fn_or_module=...") from exc
+    except BaseException as exc:
+        mark_user_target_error(exc)
+        raise
     if not callable(target):
         raise ValueError("captured import path is not callable")
     return target
@@ -229,11 +234,7 @@ def _prepare_state(capsule, module):
         kwargs = state.get("kwargs", {})
         if module is not None and "module" in capsule.pre.roots:
             restore_state_snapshot(capsule.pre, module=module)
-        restore_state_snapshot(
-            capsule.pre,
-            args=args if "args" in capsule.pre.roots else None,
-            kwargs=kwargs if "kwargs" in capsule.pre.roots else None,
-        )
+        restore_state_snapshot(capsule.pre, args=args if "args" in capsule.pre.roots else None, kwargs=kwargs if "kwargs" in capsule.pre.roots else None)
         if outer_inference:
             args = _clone_inference_values(args)
             kwargs = _clone_inference_values(kwargs)
@@ -247,6 +248,8 @@ def _sync_devices():
         try:
             if backend.is_available():
                 backend.synchronize()
+        except TimeoutError:
+            raise
         except (RuntimeError, OSError):
             continue
 def _clone_inference_values(value):
@@ -312,7 +315,7 @@ def _run_with_state(fn, args, kwargs, execution_state, module=None):
                             submodule.training = bool(targets[name])
                 elif execution_state.get("training") is not None:
                     module.train(bool(execution_state["training"]))
-            return fn(*args, **kwargs)
+            return call_user_target(fn, *args, **kwargs)
     finally:
         if module is not None:
             for name, submodule in module.named_modules(remove_duplicate=False):

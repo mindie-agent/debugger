@@ -1,7 +1,7 @@
 # MindIE Debugger (`mindie-debugger`)
 
 <p>
-  <a href="https://github.com/mindie-agent/debugger/releases"><img src="https://img.shields.io/badge/Release-v0.1.1-blue" alt="Release v0.1.1"></a>
+  <a href="https://github.com/mindie-agent/debugger/releases"><img src="https://img.shields.io/badge/Release-v0.1.2-blue" alt="Release v0.1.2"></a>
 </p>
 
 [中文](README.md)
