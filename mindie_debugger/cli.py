@@ -716,8 +716,9 @@ def _run_triage(args, raw_argv: list[str]) -> int:
             text, scanned_files = _read_bounded_log_text(target_path), [str(target_path)]
     else:
         stdin_text = ""
-        if not sys.stdin.isatty() and args.pid is None:
-            stdin_text = sys.stdin.read()
+        if sys.stdin is not None and not sys.stdin.isatty() and args.pid is None:
+            buf = getattr(sys.stdin, "buffer", None)
+            stdin_text = buf.read().decode("utf-8", errors="replace") if buf is not None else sys.stdin.read()
         if stdin_text.strip():
             text, scanned_files = stdin_text, ["<stdin>"]
         else:

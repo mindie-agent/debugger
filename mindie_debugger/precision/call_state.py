@@ -50,6 +50,8 @@ def _capture_rng():
                 state["npu"] = npu.get_rng_state()
                 if hasattr(npu, "get_rng_state_all"):
                     state["npu_all"] = npu.get_rng_state_all()
+        except TimeoutError:
+            raise
         except (RuntimeError, OSError):
             pass
     return state
@@ -67,6 +69,8 @@ def _restore_rng(state):
             npu.set_rng_state(state["npu"].to("cpu"))
             if "npu_all" in state and hasattr(npu, "set_rng_state_all"):
                 npu.set_rng_state_all([item.to("cpu") for item in state["npu_all"]])
+        except TimeoutError:
+            raise
         except (RuntimeError, OSError):
             pass
 def _generator_map(args, kwargs, module):
@@ -106,6 +110,8 @@ def _distributed_initialized(torch):
         return False
     try:
         return bool(distributed.is_initialized())
+    except TimeoutError:
+        raise
     except (RuntimeError, OSError):
         return False
 def _distributed_topology(torch):
@@ -114,6 +120,8 @@ def _distributed_topology(torch):
         return None
     try:
         return int(distributed.get_rank()), int(distributed.get_world_size())
+    except TimeoutError:
+        raise
     except (RuntimeError, OSError, AttributeError):
         return None
 def _backend_initialized(torch, name):
@@ -123,6 +131,8 @@ def _backend_initialized(torch, name):
         return False
     try:
         return bool(getter())
+    except TimeoutError:
+        raise
     except (RuntimeError, OSError):
         return False
 def _apply_det_lock(torch, det_lock):
@@ -231,6 +241,8 @@ def _record_collective_group(distributed, name, group, trace):
     try:
         rank = int(distributed.get_rank(group))
         world = int(distributed.get_world_size(group))
+    except TimeoutError:
+        raise
     except (RuntimeError, OSError, TypeError, AttributeError):
         rank = world = None
     trace.append((name, rank, world))

@@ -55,10 +55,11 @@ def _same_device(a, b) -> bool:
         if getter is not None:
             try:
                 return int(getter())
+            except TimeoutError:
+                raise
             except (RuntimeError, OSError, TypeError):
                 return None
         return None
-
     return resolved_index(left) == resolved_index(right)
 
 
@@ -82,8 +83,7 @@ def _event_like(value) -> bool:
     module = str(getattr(type(value), "__module__", ""))
     if module.startswith(("torch", "torch_npu")):
         return True
-    return any(callable(getattr(value, name, None))
-               for name in ("record", "query", "synchronize"))
+    return any(callable(getattr(value, name, None)) for name in ("record", "query", "synchronize"))
 
 
 def _current_stream(device):
@@ -93,9 +93,13 @@ def _current_stream(device):
     if getter is None: return None
     try:
         return getter(device)
+    except TimeoutError:
+        raise
     except (TypeError, RuntimeError, OSError):
         try:
             return getter()
+        except TimeoutError:
+            raise
         except (TypeError, RuntimeError, OSError):
             return None
 

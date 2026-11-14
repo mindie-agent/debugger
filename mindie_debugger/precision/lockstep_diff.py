@@ -143,6 +143,8 @@ class LockstepDiffer:
             try:
                 rank = (distributed.get_rank()
                         if distributed is not None and distributed.is_initialized() else 0)
+            except TimeoutError:
+                raise
             except (RuntimeError, OSError):
                 rank = 0
         self.rank = int(rank)
