@@ -149,14 +149,10 @@ def _build_remote_execution_guide(
 
 
 def _add_precision_subparsers(pactions):
-    inspect_capsule = pactions.add_parser(
-        "inspect-capsule", aliases=["inspect_capsule"],
-        help="print a saved call capsule summary")
+    inspect_capsule = pactions.add_parser("inspect-capsule", aliases=["inspect_capsule"], help="print a saved call capsule summary")
     inspect_capsule.add_argument("capsule", nargs="?")
     inspect_capsule.add_argument("--capsule", "--capsule-path", "--path", dest="capsule_opt")
-    replay = pactions.add_parser(
-        "replay-call", aliases=["replay_call", "call-repro"],
-        help="replay one captured call from its pre-call state")
+    replay = pactions.add_parser("replay-call", aliases=["replay_call", "call-repro"], help="replay one captured call from its pre-call state")
     replay.add_argument("capsule", nargs="?")
     replay.add_argument("--capsule", "--capsule-path", dest="capsule_opt")
     replay.add_argument("--callable", help="explicit module:qualname callable")
@@ -166,23 +162,17 @@ def _add_precision_subparsers(pactions):
     replay.add_argument("--reference-atol", type=float, default=1e-3)
     replay.add_argument("--reference-rtol", type=float, default=1e-3)
     replay.add_argument("--save-output")
-    check_call = pactions.add_parser(
-        "check-call", aliases=["check_call"],
-        help="capture and run FP32 reference_check + sensitivity probes on a callable")
+    check_call = pactions.add_parser("check-call", aliases=["check_call"], help="capture and run FP32 reference_check + sensitivity probes on a callable")
     check_call.add_argument("--callable", required=True, help="module:qualname returning (fn, args, kwargs) or zero-arg fn")
     check_call.add_argument("--reference-atol", type=float, default=1e-3)
     check_call.add_argument("--reference-rtol", type=float, default=1e-3)
-    compare = pactions.add_parser(
-        "compare-traces", aliases=["compare_traces", "lockstep-diff"],
-        help="compare two lockstep JSON reports")
+    compare = pactions.add_parser("compare-traces", aliases=["compare_traces", "lockstep-diff"], help="compare two lockstep JSON reports")
     compare.add_argument("baseline", nargs="?")
     compare.add_argument("target", nargs="?")
     compare.add_argument("--baseline", "--baseline-file", dest="baseline_opt")
     compare.add_argument("--target", "--target-file", dest="target_opt")
     compare.add_argument("--output")
-    slim = pactions.add_parser(
-        "slim-moe", aliases=["slim_moe"],
-        help="slice routed experts in a safetensors MoE checkpoint")
+    slim = pactions.add_parser("slim-moe", aliases=["slim_moe"], help="slice routed experts in a safetensors MoE checkpoint")
     slim.add_argument("input_dir", nargs="?")
     slim.add_argument("output_dir", nargs="?")
     slim.add_argument("target", nargs="?", type=int)
@@ -285,15 +275,20 @@ def _import_callable(spec):
     if not spec:
         return None
     import importlib
+    from .observability import mark_user_target_error
     cwd = os.getcwd()
     if cwd not in sys.path:
         sys.path.insert(0, cwd)
     module_name, separator, qualname = spec.partition(":")
     if not separator or not module_name:
         raise ValueError("callable must be module:qualname")
-    target = importlib.import_module(module_name)
-    for part in qualname.split("."):
-        target = getattr(target, part)
+    try:
+        target = importlib.import_module(module_name)
+        for part in qualname.split("."):
+            target = getattr(target, part)
+    except BaseException as exc:
+        mark_user_target_error(exc)
+        raise
     if not callable(target):
         raise ValueError(f"{spec} is not callable")
     return target
@@ -397,9 +392,10 @@ def _run_precision(args, raw_argv: list[str] | None = None):
                 torch.save(result["outputs"], args.save_output)
             return _jsonable(result), (0 if result.get("status") == "ok" else 1)
         if action == "check-call":
+            from .observability import call_user_target
             from .precision import capture_call, replay_call
             target = _import_callable(args.callable)
-            spec = target()
+            spec = call_user_target(target)
             if isinstance(spec, tuple) and len(spec) >= 2 and callable(spec[0]):
                 fn = spec[0]
                 call_args = spec[1] if isinstance(spec[1], (list, tuple)) else (spec[1],)
@@ -735,14 +731,12 @@ def _run_triage(args, raw_argv: list[str]) -> int:
                 default_root, pid=args.pid, latest=args.latest, window_sec=args.window_sec
             )
     payload = triage_npu_fault(text)
+    from .observability import verify_triage_payload_contract
+    if not verify_triage_payload_contract(payload):
+        return _print_error("triage_contract_violation", error="triage_npu_fault returned invalid schema")
     if scanned_files:
-        payload["scanned_file_count"] = len(scanned_files)
-        payload["scanned_files"] = scanned_files[:16]
-    live_env = (
-        _inspect_live_process_env(args.pid)
-        if (args.pid is not None and not args.text and not args.file)
-        else None
-    )
+        payload["scanned_file_count"], payload["scanned_files"] = len(scanned_files), scanned_files[:16]
+    live_env = _inspect_live_process_env(args.pid) if (args.pid is not None and not args.text and not args.file) else None
     if live_env is not None:
         payload["live_process_env_audit"] = live_env
     payload["remote_npu_execution_guide"] = _build_remote_execution_guide(raw_argv)
@@ -751,44 +745,43 @@ def _run_triage(args, raw_argv: list[str]) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    from .observability import emit_incident_stderr, is_owned_debugger_exception, record_debugger_failure
     raw_argv = list(argv) if argv is not None else sys.argv[1:]
     args = parser().parse_args(raw_argv)
-    if args.command in ("remote-guide", "guide", "stage-remote", "how-to-run"):
-        guide = _build_remote_execution_guide( stage_dir=getattr(args, "stage_dir", None))
-        print(json.dumps({"status": "ok", "remote_npu_execution_guide": guide}, ensure_ascii=True))
-        return 0
-    if args.command == "decode-code":
-        from .npu_fault_triage import decode_cann_error_code
-        print(json.dumps(decode_cann_error_code(args.code), ensure_ascii=True))
-        return 0
-    if args.command == "triage":
-        try:
-            return _run_triage(args, raw_argv)
-        except TimeoutError:
-            raise
-        except OSError as exc:
-            return _print_error("log_read_failed", error_type=type(exc).__name__,
-                                error=str(exc)[:240], errno=exc.errno,
-                                path=getattr(exc, "filename", None))
-    if args.command == "aclgraph":
-        try:
-            result, code = _run_aclgraph(args, raw_argv)
-        except Exception as exc:
-            result = {"status": "error", "category": "aclgraph_operation_failed",
-                      "error_type": type(exc).__name__, "error": str(exc)[:240]}
-            code = 1
-        print(json.dumps(_jsonable(result), ensure_ascii=True, default=str))
-        return int(code)
-    if args.command == "precision":
-        try:
-            result, code = _run_precision(args, raw_argv)
-        except Exception as exc:
-            result = {"status": "error", "category": "precision_operation_failed",
-                      "error_type": type(exc).__name__, "error": str(exc)[:240]}
-            code = 1
-        print(json.dumps(_jsonable(result), ensure_ascii=True, default=str))
-        return int(code)
-    return 2
+    op_name = f"debugger.{args.command}"
+    try:
+        if args.command in ("remote-guide", "guide", "stage-remote", "how-to-run"):
+            guide = _build_remote_execution_guide(stage_dir=getattr(args, "stage_dir", None))
+            print(json.dumps({"status": "ok", "remote_npu_execution_guide": guide}, ensure_ascii=True))
+            return 0
+        if args.command == "decode-code":
+            from .npu_fault_triage import decode_cann_error_code
+            print(json.dumps(decode_cann_error_code(args.code), ensure_ascii=True))
+            return 0
+        if args.command == "triage":
+            try:
+                return _run_triage(args, raw_argv)
+            except TimeoutError:
+                raise
+            except OSError as exc:
+                return _print_error("log_read_failed", error_type=type(exc).__name__,
+                                    error=str(exc)[:240], errno=exc.errno, path=getattr(exc, "filename", None))
+        if args.command in ("aclgraph", "precision"):
+            runner, cat = (_run_aclgraph, "aclgraph_operation_failed") if args.command == "aclgraph" else (_run_precision, "precision_operation_failed")
+            try:
+                result, code = runner(args, raw_argv)
+            except Exception as exc:
+                if is_owned_debugger_exception(exc):
+                    record_debugger_failure(op_name, stage="subcommand_run", exception=exc)
+                result = {"status": "error", "category": cat, "error_type": type(exc).__name__, "error": str(exc)[:240]}
+                code = 1
+            print(json.dumps(_jsonable(result), ensure_ascii=True, default=str))
+            return int(code)
+        return 2
+    except Exception as exc:
+        if is_owned_debugger_exception(exc):
+            emit_incident_stderr(record_debugger_failure(op_name, stage="cli_dispatch", exception=exc))
+        raise
 
 
 if __name__ == "__main__":
