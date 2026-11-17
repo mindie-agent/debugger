@@ -11,7 +11,7 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
-        python: ['3.11', '3.13']
+        python: ['3.11', '3.12', '3.13']
     runs-on: ${{ matrix.os }}
     timeout-minutes: 10
     steps:
@@ -21,32 +21,41 @@ jobs:
           python-version: ${{ matrix.python }}
       - run: uv venv
       - run: uv pip install -e ".[test]"
-      - run: uv run --no-project python -m pytest -q --junitxml=results.xml
+      - run: uv run --no-project python -m pytest -q -m "not live_npu" --junitxml=results.xml
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: debugger-${{ matrix.os }}-${{ matrix.python }}
           path: results.xml
+
   wheel:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v6
         with:
-          python-version: '3.11'
+          python-version: '3.12'
       - run: uv build
-      - run: |
+      - name: Installed-wheel smoke check outside checkout
+        run: |
           uv venv /tmp/debugger-wheel
           uv pip install --python /tmp/debugger-wheel/bin/python --no-deps dist/*.whl
-          cd /tmp
-          /tmp/debugger-wheel/bin/python -c "import importlib.metadata as m; assert not [x for x in m.requires('mindie-debugger') or [] if 'extra ==' not in x]"
-          /tmp/debugger-wheel/bin/mindie-debugger --help
+          mkdir -p /tmp/debugger-smoke-cwd /tmp/debugger-smoke-home
+          cd /tmp/debugger-smoke-cwd
+          HOME=/tmp/debugger-smoke-home MINDIE_DATA_HOME=/tmp/debugger-smoke-home/data \
+            /tmp/debugger-wheel/bin/python -c "import importlib.metadata as m, mindie_debugger; assert 'site-packages' in mindie_debugger.__file__; assert not [x for x in m.requires('mindie-debugger') or [] if 'extra ==' not in x]"
+          HOME=/tmp/debugger-smoke-home MINDIE_DATA_HOME=/tmp/debugger-smoke-home/data \
+            /tmp/debugger-wheel/bin/mindie-debugger triage --text "EZ9999: Inner error (aicore timeout)" >/tmp/debugger-triage.json
+          test ! -e /tmp/debugger-smoke-home/data
+          test -z "$(ls -A /tmp/debugger-smoke-cwd)"
 
   release-ready:
     name: release-ready
     needs: [test, wheel]
     if: always()
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - env:
           RESULTS: ${{ toJSON(needs) }}

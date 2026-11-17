@@ -33,6 +33,7 @@ from __future__ import annotations
 import contextlib
 import math
 import statistics
+import sys
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -88,8 +89,8 @@ class CallCapsule:
 from .call_state import (
     _DET_LOCK_ENV, _apply_det_lock, _callable_metadata, _capture_execution_state,
     _capture_generators, _capture_rng, _distributed_initialized,
-    _distributed_topology, _restore_generators, _restore_rng,
-    normalized_collective_trace, trace_collectives,
+    _distributed_topology, _referenced_devices, _restore_generators, _restore_rng,
+    _sync_referenced_devices, normalized_collective_trace, trace_collectives,
 )
 from .jitter import JitterAccumulator, _tensor_bytes
 def capture_call(fn_or_module, *args, save_path=None, metadata=None, **kwargs):
@@ -99,7 +100,8 @@ def capture_call(fn_or_module, *args, save_path=None, metadata=None, **kwargs):
         raise ValueError("fn_or_module must be callable")
     module = fn_or_module if isinstance(fn_or_module, torch.nn.Module) else None
     pre = capture_state_snapshot(args=args, kwargs=kwargs, module=module)
-    rng_state = _capture_rng()
+    referenced = _referenced_devices(pre, args=args, kwargs=kwargs, module=module)
+    rng_state = _capture_rng(referenced)
     generators = _capture_generators(args, kwargs, module)
     if generators:
         rng_state["generators"] = generators
@@ -239,19 +241,6 @@ def _prepare_state(capsule, module):
             args = _clone_inference_values(args)
             kwargs = _clone_inference_values(kwargs)
     return args, kwargs
-def _sync_devices():
-    torch = _require_torch()
-    for name in ("npu", "cuda"):
-        backend = getattr(torch, name, None)
-        if backend is None:
-            continue
-        try:
-            if backend.is_available():
-                backend.synchronize()
-        except TimeoutError:
-            raise
-        except (RuntimeError, OSError):
-            continue
 def _clone_inference_values(value):
     torch = _require_torch()
     checker = getattr(torch, "is_inference", None)
@@ -298,10 +287,9 @@ def _run_with_state(fn, args, kwargs, execution_state, module=None):
                     stack.enter_context(torch.autocast(
                         device_type=device_type, dtype=dtype, enabled=True))
             else:
-                # Disable inherited outer autocast for every supported device
-                # type; unavailable extensions (e.g. npu without torch_npu) are
-                # simply skipped.
-                for device_type in ("cpu", "cuda", "npu"):
+                # Disable inherited outer autocast for loaded backends only.
+                autocast_types = ("cpu", "cuda", "npu") if "torch_npu" in sys.modules else ("cpu", "cuda")
+                for device_type in autocast_types:
                     try:
                         stack.enter_context(
                             torch.autocast(device_type=device_type, enabled=False))
@@ -362,7 +350,8 @@ def _reference_check(capsule, module, reference_fn, actual_post,
     if reference_fn is None:
         return {"status": _EVAL_UNSUPPORTED, "reason": "explicit_reference_fn_required"}
     torch = _require_torch()
-    _restore_rng(capsule.rng_state)
+    pre_devices = _referenced_devices(capsule.pre, module=module)
+    _restore_rng(capsule.rng_state, pre_devices)
     try:
         # Restore the original module even when the reference is a plain
         # function closing over it; otherwise it would see the last trial's
@@ -581,7 +570,8 @@ def _fakequant_check(capsule, fn_or_module, contract, original_float_weight,
     if module is None:
         return {"status": _EVAL_UNSUPPORTED, "reason": "module_with_weight_required",
                 "contract": asdict(contract)}
-    _restore_rng(capsule.rng_state)
+    pre_devices = _referenced_devices(capsule.pre, module=module)
+    _restore_rng(capsule.rng_state, pre_devices)
     args, kwargs = _prepare_state(capsule, module)
     _restore_generators(capsule.rng_state, args, kwargs, module)
     found = _find_kernel_weight(module)
@@ -608,7 +598,7 @@ def _fakequant_check(capsule, fn_or_module, contract, original_float_weight,
         return {"status": _EVAL_UNSUPPORTED, "reason": "independent_reference_required",
                 "contract": asdict(contract)}
     else:
-        _restore_rng(capsule.rng_state)
+        _restore_rng(capsule.rng_state, pre_devices)
         saved_parameter = owner._parameters.get(name)
         saved_buffer = owner._buffers.get(name)
         try:
@@ -726,19 +716,21 @@ def replay_call(capsule_or_path, fn_or_module=None, *, repeat=1, det_lock=False,
     timings = []
     actual_post = None
     actual_output = None
+    pre_devices = _referenced_devices(capsule.pre, module=module)
+    sync_devices = _referenced_devices(capsule.pre, capsule.post, module=module)
     try:
         for trial in range(int(repeat)):
-            _restore_rng(capsule.rng_state)
+            _restore_rng(capsule.rng_state, pre_devices)
             args, kwargs = _prepare_state(capsule, module)
             _restore_generators(capsule.rng_state, args, kwargs, module)
-            _restore_rng(capsule.rng_state)
-            _sync_devices()
+            _restore_rng(capsule.rng_state, pre_devices)
+            _sync_referenced_devices(sync_devices)
             started = time.perf_counter()
             trial_trace = []
             with trace_collectives(torch, trial_trace):
                 output = _run_with_state(
                     fn, args, kwargs, capsule.execution_state, module)
-            _sync_devices()
+            _sync_referenced_devices(sync_devices)
             timings.append((time.perf_counter() - started) * 1000.0)
             observed_trace = normalized_collective_trace(trial_trace)
             if ((expected_trace or _distributed_initialized(torch))

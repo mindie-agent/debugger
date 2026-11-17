@@ -117,7 +117,7 @@ def test_aclgraph_address_tracker_catches_rebound_pointer_and_padded_slots():
     assert any(v["kind"] == "block_table_capacity_insufficient" for v in hole_rep["violations"])
 
     # Context-parallel nonlocal active slots (-1) with local_slot_mask + sliding-window evicted null blocks
-    cp_swa_rep = tracker.verify_replay(
+    cp_swa_rep = ACLGraphAddressTracker().verify_replay(
         actual_tokens=4,
         block_size=16,
         num_blocks=4,
