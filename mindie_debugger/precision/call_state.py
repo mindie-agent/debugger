@@ -6,8 +6,9 @@
   trace distributed collective calls so replay can detect topology changes.
 
 [Invariants]
-  * RNG restoration targets the current process/device and never fabricates
-    state that was not captured.
+  * RNG restoration targets only initialized backends and the exact device
+    indices referenced by the captured call; never calls ``get_rng_state_all``
+    or ``__import__("torch_npu")`` on CPU/control paths.
   * Collective tracing only wraps ``torch.distributed`` while active and always
     restores the exact original callables in ``finally``.
   * The recorded trace is a list of ``(op_name, group_rank, group_world_size)``
@@ -21,6 +22,7 @@
   temporarily monkey-patches ``torch.distributed`` functions.
 """
 from __future__ import annotations
+import importlib.metadata
 import inspect
 import os
 import sys
@@ -38,41 +40,149 @@ _COLLECTIVE_OPS = (
 def _require_torch():
     from .storage_graph import _require_torch as getter
     return getter()
-def _capture_rng():
+def _torch_npu_version() -> str | None:
+    try:
+        return importlib.metadata.version("torch_npu")
+    except importlib.metadata.PackageNotFoundError:
+        return None
+def _backend_initialized(torch, name: str) -> bool:
+    if name == "npu" and torch is sys.modules.get("torch") and "torch_npu" not in sys.modules:
+        return False
+    backend = getattr(torch, name, None)
+    getter = getattr(backend, "is_initialized", None)
+    if getter is None:
+        return False
+    try:
+        return bool(getter())
+    except TimeoutError:
+        raise
+    except (RuntimeError, OSError):
+        return False
+def _parse_device_spec(torch, raw: object, out: dict[str, set[int]]) -> None:
+    spec = str(raw or "").strip().lower()
+    if not spec or spec.startswith(("cpu", "meta")):
+        return
+    dtype, sep, idx_text = spec.partition(":")
+    if dtype not in ("npu", "cuda"):
+        return
+    if sep and idx_text.isdigit():
+        out.setdefault(dtype, set()).add(int(idx_text))
+        return
+    if _backend_initialized(torch, dtype):
+        backend = getattr(torch, dtype, None)
+        cur = getattr(backend, "current_device", None)
+        if callable(cur):
+            try:
+                out.setdefault(dtype, set()).add(int(cur()))
+            except TimeoutError:
+                raise
+            except (RuntimeError, OSError):
+                pass
+def _referenced_devices(*snapshots, args=None, kwargs=None, module=None) -> dict[str, set[int]]:
     torch = _require_torch()
-    state = {"cpu": torch.random.get_rng_state()}
-    if hasattr(torch, "cuda") and torch.cuda.is_available():
-        state["cuda"] = torch.cuda.get_rng_state_all()
-    npu = getattr(torch, "npu", None)
-    if npu is not None:
-        try:
-            if npu.is_available() and hasattr(npu, "get_rng_state"):
-                state["npu"] = npu.get_rng_state()
-                if hasattr(npu, "get_rng_state_all"):
-                    state["npu_all"] = npu.get_rng_state_all()
-        except TimeoutError:
-            raise
-        except (RuntimeError, OSError):
-            pass
+    found: dict[str, set[int]] = {}
+    for snap in snapshots:
+        if snap is None:
+            continue
+        for view in getattr(snap, "views", ()):
+            _parse_device_spec(torch, getattr(view, "device_str", None), found)
+        for node in getattr(snap, "storages", {}).values():
+            _parse_device_spec(torch, getattr(node, "device_str", None), found)
+    if args is not None or kwargs is not None or module is not None:
+        for gen in _generator_map(args, kwargs, module).values():
+            _parse_device_spec(torch, getattr(gen, "device", None), found)
+    return found
+def _capture_rng(devices: dict[str, set[int]] | None = None):
+    torch = _require_torch()
+    state: dict[str, object] = {"cpu": torch.random.get_rng_state()}
+    for name in ("cuda", "npu"):
+        dev_ids = sorted((devices or {}).get(name) or ())
+        if not dev_ids or not _backend_initialized(torch, name):
+            continue
+        backend = getattr(torch, name, None)
+        getter = getattr(backend, "get_rng_state", None)
+        if not callable(getter):
+            continue
+        per_device = {}
+        for dev_id in dev_ids:
+            try:
+                per_device[int(dev_id)] = getter(int(dev_id)).to("cpu")
+            except TimeoutError:
+                raise
+            except (RuntimeError, OSError, TypeError):
+                continue
+        if per_device:
+            state[f"{name}_devices"] = per_device
     return state
-def _restore_rng(state):
+def _restore_rng(state, devices: dict[str, set[int]] | None = None):
     torch = _require_torch()
     if not state:
         return
     if state.get("cpu") is not None:
         torch.random.set_rng_state(state["cpu"].to("cpu"))
-    if "cuda" in state and hasattr(torch, "cuda") and torch.cuda.is_available():
-        torch.cuda.set_rng_state_all([item.to("cpu") for item in state["cuda"]])
-    npu = getattr(torch, "npu", None)
-    if npu is not None and "npu" in state and npu.is_available():
-        try:
-            npu.set_rng_state(state["npu"].to("cpu"))
-            if "npu_all" in state and hasattr(npu, "set_rng_state_all"):
-                npu.set_rng_state_all([item.to("cpu") for item in state["npu_all"]])
-        except TimeoutError:
-            raise
-        except (RuntimeError, OSError):
-            pass
+    for name in ("cuda", "npu"):
+        if not _backend_initialized(torch, name):
+            continue
+        backend = getattr(torch, name, None)
+        setter = getattr(backend, "set_rng_state", None)
+        if not callable(setter):
+            continue
+        allowed = (devices or {}).get(name)
+        saved_map = state.get(f"{name}_devices")
+        if isinstance(saved_map, dict):
+            for raw_dev, rng_tensor in sorted(saved_map.items(), key=lambda item: int(item[0])):
+                dev_id = int(raw_dev)
+                if allowed is not None and dev_id not in allowed:
+                    continue
+                try:
+                    setter(rng_tensor.to("cpu"), dev_id)
+                except TimeoutError:
+                    raise
+                except (RuntimeError, OSError, TypeError):
+                    continue
+        elif name == "npu" and isinstance(state.get("npu_all"), list) and allowed:
+            for dev_id in sorted(allowed):
+                if 0 <= int(dev_id) < len(state["npu_all"]):
+                    try:
+                        setter(state["npu_all"][int(dev_id)].to("cpu"), int(dev_id))
+                    except TimeoutError:
+                        raise
+                    except (RuntimeError, OSError, TypeError):
+                        continue
+        elif name == "npu" and state.get("npu") is not None and allowed:
+            for dev_id in sorted(allowed):
+                try:
+                    setter(state["npu"].to("cpu"), int(dev_id))
+                except TimeoutError:
+                    raise
+                except (RuntimeError, OSError, TypeError):
+                    continue
+        elif name == "cuda" and isinstance(state.get("cuda"), list) and allowed:
+            for dev_id in sorted(allowed):
+                if 0 <= int(dev_id) < len(state["cuda"]):
+                    try:
+                        setter(state["cuda"][int(dev_id)].to("cpu"), int(dev_id))
+                    except TimeoutError:
+                        raise
+                    except (RuntimeError, OSError, TypeError):
+                        continue
+def _sync_referenced_devices(devices: dict[str, set[int]] | None = None) -> None:
+    torch = _require_torch()
+    for name in ("npu", "cuda"):
+        dev_ids = sorted((devices or {}).get(name) or ())
+        if not dev_ids or not _backend_initialized(torch, name):
+            continue
+        backend = getattr(torch, name, None)
+        sync = getattr(backend, "synchronize", None)
+        if not callable(sync):
+            continue
+        for dev_id in dev_ids:
+            try:
+                sync(int(dev_id))
+            except TimeoutError:
+                raise
+            except (RuntimeError, OSError, TypeError):
+                continue
 def _generator_map(args, kwargs, module):
     torch = _require_torch()
     from .storage_graph import flatten_tree_with_paths, path_to_string
@@ -124,17 +234,6 @@ def _distributed_topology(torch):
         raise
     except (RuntimeError, OSError, AttributeError):
         return None
-def _backend_initialized(torch, name):
-    backend = getattr(torch, name, None)
-    getter = getattr(backend, "is_initialized", None)
-    if getter is None:
-        return False
-    try:
-        return bool(getter())
-    except TimeoutError:
-        raise
-    except (RuntimeError, OSError):
-        return False
 def _apply_det_lock(torch, det_lock):
     report = {
         "applied": bool(det_lock),
@@ -161,7 +260,7 @@ def _capture_execution_state(fn_or_module):
         "training": None,
         "submodule_training": None,
         "torch_version": torch.__version__,
-        "torch_npu_version": None,
+        "torch_npu_version": _torch_npu_version(),
         "backend_env": {key: os.environ.get(key) for key in _DET_LOCK_ENV},
         "distributed_initialized": _distributed_initialized(torch),
         "distributed_rank": None,
@@ -170,11 +269,6 @@ def _capture_execution_state(fn_or_module):
     topology = _distributed_topology(torch)
     if topology is not None:
         state["distributed_rank"], state["distributed_world_size"] = topology
-    try:
-        torch_npu = __import__("torch_npu")
-        state["torch_npu_version"] = getattr(torch_npu, "__version__", None)
-    except ImportError:
-        pass
     if isinstance(fn_or_module, torch.nn.Module):
         state["training"] = bool(fn_or_module.training)
         state["submodule_training"] = {
@@ -185,7 +279,8 @@ def _capture_execution_state(fn_or_module):
         state["autocast"] = bool(torch.is_autocast_enabled())
     except TypeError:
         pass
-    for device_type in ("npu", "cuda", "cpu"):
+    autocast_types = ("npu", "cuda", "cpu") if "torch_npu" in sys.modules else ("cuda", "cpu")
+    for device_type in autocast_types:
         getter = getattr(torch, "get_autocast_dtype", None)
         if getter is None:
             break

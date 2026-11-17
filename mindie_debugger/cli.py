@@ -17,8 +17,10 @@
   Single-invocation CLI; acquires no locks and spawns no background threads.
 
 [Side-Effect Policy]
-  Reads user-specified log/capsule/trace files and writes only to explicitly
-  requested `--output` / `--save-output` / `--stage-dir` or bundle cache paths.
+  `triage` and `decode-code` are strictly read-only (`local_bundle_path` points to
+  the packaged `mindie_debugger` directory). Explicit staging (`stage-remote` or
+  `remote-guide --stage-dir`) writes only clean `.py` files into an owned leaf
+  directory without calling `shutil.rmtree`.
 """
 from __future__ import annotations
 
@@ -33,117 +35,94 @@ import sys
 from pathlib import Path
 from typing import Any
 
+_BUNDLE_MARKER = ".mindie-debugger-bundle.json"
+
 
 def _stage_remote_bundle(stage_dir: str | Path | None = None) -> Path:
-    """Copy clean `.py` sources of `mindie_debugger` (no `__pycache__`) to a local staging directory."""
+    """Copy clean `.py` sources of `mindie_debugger` into an owned leaf directory without `rmtree`."""
     pkg_src = Path(__file__).resolve().parent
     if stage_dir is not None:
         bundle_root = Path(stage_dir).expanduser().resolve()
+        forbidden = {Path("/"), Path.home().resolve(), Path.cwd().resolve(), pkg_src, *pkg_src.parents}
+        if bundle_root in forbidden:
+            raise ValueError(f"Refusing to stage bundle into protected root '{bundle_root}'")
+        marker = bundle_root / _BUNDLE_MARKER
+        if bundle_root.exists() and any(bundle_root.iterdir()) and not marker.is_file():
+            bundle_root = bundle_root / "mindie_debugger"
+            marker = bundle_root / _BUNDLE_MARKER
+            if bundle_root.exists() and any(bundle_root.iterdir()) and not marker.is_file():
+                raise ValueError(f"Staging target '{bundle_root}' is non-empty and not owned by mindie-debugger")
     else:
         data_home = Path(
             os.environ.get("MINDIE_DATA_HOME")
             or (Path.home() / ".local" / "share" / "mindie-agent")
         ).expanduser().resolve()
         bundle_root = data_home / "debugger-bundle" / "mindie_debugger"
-    if bundle_root.exists():
-        shutil.rmtree(bundle_root)
+        marker = bundle_root / _BUNDLE_MARKER
     bundle_root.mkdir(parents=True, exist_ok=True)
+    previous_files: set[str] = set()
+    if marker.is_file():
+        try:
+            previous_files = set(json.loads(marker.read_text(encoding="utf-8")).get("files", ()))
+        except (OSError, ValueError):
+            previous_files = set()
+    written: list[str] = []
     for py_file in sorted(pkg_src.rglob("*.py")):
         if "__pycache__" in py_file.parts:
             continue
-        rel = py_file.relative_to(pkg_src)
+        rel = py_file.relative_to(pkg_src).as_posix()
         dest = bundle_root / rel
         dest.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(py_file, dest)
+        written.append(rel)
+    for stale in previous_files - set(written):
+        if ".." not in Path(stale).parts:
+            (bundle_root / stale).unlink(missing_ok=True)
+    marker.write_text(json.dumps({"files": written}), encoding="utf-8", newline="\n")
     return bundle_root
 
 
 def _build_remote_execution_guide(
     argv: list[str] | None = None,
     stage_dir: str | Path | None = None,
+    *,
+    stage_bundle: bool = False,
 ) -> dict[str, Any]:
-    bundle_path = _stage_remote_bundle(stage_dir)
+    bundle_path = _stage_remote_bundle(stage_dir) if stage_bundle else Path(__file__).resolve().parent
     quoted_args = " ".join(shlex.quote(a) for a in (argv or ["triage"]))
+    cli_prefix = "PYTHONPATH=.mindie_debugger:$PYTHONPATH python3 -m mindie_debugger.cli"
     return {
         "summary": (
             "CANN plogs, ACLGraph, and NPU precision tools run on the target Ascend host. "
-            "Copy the staged pure-Python bundle from local_bundle_path with scp/rsync/SSH "
+            "Copy the pure-Python bundle from local_bundle_path with scp/rsync/SSH "
             "or optional remote-dev tools, then run the CLI there."
         ),
         "local_bundle_path": str(bundle_path),
+        "bundle_staged": bool(stage_bundle),
         "remote_stage_path": ".mindie_debugger/mindie_debugger",
         "step_1_push_bundle_to_npu_container": {
             "mcp_tool": "mcp__remote-dev__remote_artifact_push",
-            "arguments": {
-                "local_path": str(bundle_path),
-                "remote_path": ".mindie_debugger/mindie_debugger",
-            },
+            "arguments": {"local_path": str(bundle_path), "remote_path": ".mindie_debugger/mindie_debugger"},
         },
         "step_2_execute_cli_in_npu_container": {
             "mcp_tool": "mcp__remote-dev__remote_bash",
-            "command": f"PYTHONPATH=.mindie_debugger:$PYTHONPATH python3 -m mindie_debugger.cli {quoted_args}",
+            "command": f"{cli_prefix} {quoted_args}",
             "cli_examples": {
-                "triage_cann_plog_auto": (
-                    "PYTHONPATH=.mindie_debugger:$PYTHONPATH python3 -m mindie_debugger.cli triage"
-                ),
-                "triage_cann_plog_by_pid": (
-                    "PYTHONPATH=.mindie_debugger:$PYTHONPATH python3 -m mindie_debugger.cli triage --pid <crashed_pid>"
-                ),
-                "triage_custom_log_dir": (
-                    "PYTHONPATH=.mindie_debugger:$PYTHONPATH python3 -m mindie_debugger.cli triage --root <log_dir_or_file>"
-                ),
-                "aclgraph_guard": (
-                    "PYTHONPATH=.mindie_debugger:$PYTHONPATH python3 -m mindie_debugger.cli aclgraph guard --script <repro_or_test.py>"
-                ),
-                "aclgraph_inspect": (
-                    "PYTHONPATH=.mindie_debugger:$PYTHONPATH python3 -m mindie_debugger.cli aclgraph inspect "
-                    "--script <repro_or_test.py> --compare-eager --dump-dir /tmp/aclgraph_dump"
-                ),
-                "precision_check_call": (
-                    "PYTHONPATH=.mindie_debugger:$PYTHONPATH python3 -m mindie_debugger.cli precision check-call "
-                    "--callable <module:qualname>"
-                ),
-                "precision_replay_call": (
-                    "PYTHONPATH=.mindie_debugger:$PYTHONPATH python3 -m mindie_debugger.cli precision replay-call "
-                    "--capsule <capsule.pt> --det-lock"
-                ),
+                "triage_cann_plog_auto": f"{cli_prefix} triage",
+                "triage_cann_plog_by_pid": f"{cli_prefix} triage --pid <crashed_pid>",
+                "triage_custom_log_dir": f"{cli_prefix} triage --root <log_dir_or_file>",
+                "aclgraph_guard": f"{cli_prefix} aclgraph guard --script <repro_or_test.py>",
+                "aclgraph_inspect": f"{cli_prefix} aclgraph inspect --script <repro_or_test.py> --compare-eager --dump-dir /tmp/aclgraph_dump",
+                "precision_check_call": f"{cli_prefix} precision check-call --callable <module:qualname>",
+                "precision_replay_call": f"{cli_prefix} precision replay-call --capsule <capsule.pt> --det-lock",
             },
         },
         "step_3_python_api_in_npu_container": {
-            "ACLGraphCaptureGuard": (
-                "from mindie_debugger.aclgraph import ACLGraphCaptureGuard\n"
-                "with ACLGraphCaptureGuard(strict=False) as guard:\n"
-                "    # run model warmup + graph capture\n"
-                "print(guard.report())  # catches .item(), .cpu(), bool(tensor), .tolist() during capture"
-            ),
-            "ACLGraphAddressTracker": (
-                "from mindie_debugger.aclgraph import ACLGraphAddressTracker\n"
-                "tracker = ACLGraphAddressTracker()\n"
-                "tracker.bind_capture_inputs(meta={'slot_mapping': slot_mapping, 'seq_lens': seq_lens})\n"
-                "# during graph replay:\n"
-                "rep = tracker.verify_replay_inputs(actual_tokens=actual, padded_tokens=padded, "
-                "slot_mapping_tensor=slot_mapping, meta={'slot_mapping': slot_mapping, 'seq_lens': seq_lens})\n"
-                "print(rep)  # detects rebound_pointer and unmasked_padded_slot_mapping"
-            ),
-            "ACLGraphDumper": (
-                "from mindie_debugger.aclgraph import ACLGraphDumper\n"
-                "with ACLGraphDumper(model, include=('*attn*', '*mlp*', '*conv*'), max_steps=4, device=device) as dumper:\n"
-                "    dumper.reset_step(0)  # before capture / step 0\n"
-                "    dumper.advance_step()  # before subsequent g.replay() steps\n"
-                "    diff = dumper.compare_with_eager(eager_fn, static_input, step_index=1, atol=1e-3)\n"
-                "    print(diff['first_divergent_layer'], diff['per_layer'])"
-            ),
-            "ACLGraphVllmInspector": (
-                "from mindie_debugger.aclgraph import ACLGraphVllmInspector\n"
-                "with ACLGraphVllmInspector(dump_dir='/tmp/acl_dump', compare_eager=True) as inspector:\n"
-                "    # run vllm-ascend ACLGraphWrapper capture and replay\n"
-                "print(inspector.report())"
-            ),
-            "precision_primitives": (
-                "from mindie_debugger.precision import capture_call, replay_call\n"
-                "cap = capture_call(fn, *args, **kwargs)\n"
-                "print(replay_call(cap, fn, mode='reference_check', reference_atol=1e-3))"
-            ),
+            "ACLGraphCaptureGuard": "from mindie_debugger.aclgraph import ACLGraphCaptureGuard\nwith ACLGraphCaptureGuard(strict=False) as guard:\n    # run model warmup + graph capture\nprint(guard.report())",
+            "ACLGraphAddressTracker": "from mindie_debugger.aclgraph import ACLGraphAddressTracker\ntracker = ACLGraphAddressTracker()\ntracker.bind_capture_inputs(meta={'slot_mapping': slot_mapping, 'seq_lens': seq_lens})\nrep = tracker.verify_replay_inputs(actual_tokens=actual, padded_tokens=padded, slot_mapping_tensor=slot_mapping, meta={'slot_mapping': slot_mapping, 'seq_lens': seq_lens})\nprint(rep)",
+            "ACLGraphDumper": "from mindie_debugger.aclgraph import ACLGraphDumper\nwith ACLGraphDumper(model, include=('*attn*', '*mlp*', '*conv*'), max_steps=4, device=device) as dumper:\n    dumper.reset_step(0)\n    dumper.advance_step()\n    diff = dumper.compare_with_eager(eager_fn, static_input, step_index=1, atol=1e-3)\n    print(diff['first_divergent_layer'], diff['per_layer'])",
+            "ACLGraphVllmInspector": "from mindie_debugger.aclgraph import ACLGraphVllmInspector\nwith ACLGraphVllmInspector(dump_dir='/tmp/acl_dump', compare_eager=True) as inspector:\n    # run vllm-ascend ACLGraphWrapper capture and replay\nprint(inspector.report())",
+            "precision_primitives": "from mindie_debugger.precision import capture_call, replay_call\ncap = capture_call(fn, *args, **kwargs)\nprint(replay_call(cap, fn, mode='reference_check', reference_atol=1e-3))",
         },
     }
 
@@ -737,10 +716,25 @@ def _run_triage(args, raw_argv: list[str]) -> int:
         return _print_error("triage_contract_violation", error="triage_npu_fault returned invalid schema")
     if scanned_files:
         payload["scanned_file_count"], payload["scanned_files"] = len(scanned_files), scanned_files[:16]
-    live_env = _inspect_live_process_env(args.pid) if (args.pid is not None and not args.text and not args.file) else None
-    if live_env is not None:
-        payload["live_process_env_audit"] = live_env
-    payload["remote_npu_execution_guide"] = _build_remote_execution_guide(raw_argv)
+    warnings: list[str] = []
+    if args.pid is not None and not args.text and not args.file:
+        try:
+            live_env = _inspect_live_process_env(args.pid)
+            if live_env is not None:
+                payload["live_process_env_audit"] = live_env
+        except TimeoutError:
+            raise
+        except Exception as exc:
+            warnings.append(f"live_process_env_audit: {type(exc).__name__}: {exc}")
+    try:
+        payload["remote_npu_execution_guide"] = _build_remote_execution_guide(raw_argv)
+    except TimeoutError:
+        raise
+    except Exception as exc:
+        warnings.append(f"remote_npu_execution_guide: {type(exc).__name__}: {exc}")
+    if warnings:
+        payload["receipt_warning"] = "; ".join(warnings)
+        payload["receipt_unconfirmed"] = True
     print(json.dumps(payload, ensure_ascii=True))
     return 0
 
@@ -752,8 +746,13 @@ def main(argv: list[str] | None = None) -> int:
     op_name = f"debugger.{args.command}"
     try:
         if args.command in ("remote-guide", "guide", "stage-remote", "how-to-run"):
-            guide = _build_remote_execution_guide(stage_dir=getattr(args, "stage_dir", None))
-            print(json.dumps({"status": "ok", "remote_npu_execution_guide": guide}, ensure_ascii=True))
+            stage_dir = getattr(args, "stage_dir", None)
+            should_stage = args.command == "stage-remote" or stage_dir is not None
+            try:
+                guide = _build_remote_execution_guide(stage_dir=stage_dir, stage_bundle=should_stage)
+            except (OSError, ValueError) as exc:
+                return _print_error("stage_bundle_failed", error_type=type(exc).__name__, error=str(exc)[:240])
+            print(json.dumps({"status": "ok", "bundle_staged": should_stage, "remote_npu_execution_guide": guide}, ensure_ascii=True))
             return 0
         if args.command == "decode-code":
             from .npu_fault_triage import decode_cann_error_code
